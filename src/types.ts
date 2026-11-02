@@ -11,10 +11,24 @@ export type TaskState =
   | "unknown";
 
 export type StepName =
-  | "intent" | "rebase" | "review" | "test" | "document" | "lint" | "push" | "pr" | "ci";
+  | "intent"
+  | "rebase"
+  | "review"
+  | "test"
+  | "document"
+  | "lint"
+  | "push"
+  | "pr"
+  | "ci";
 
 export type StepStatus =
-  | "completed" | "running" | "fixing" | "awaiting_approval" | "pending" | "skipped" | "failed";
+  | "completed"
+  | "running"
+  | "fixing"
+  | "awaiting_approval"
+  | "pending"
+  | "skipped"
+  | "failed";
 
 export interface Finding {
   id: string;
@@ -139,7 +153,14 @@ export interface ApiError {
 
 /** Raw snapshot from bin/fm-bearings-snapshot.sh --json (only the fields the API reads). */
 export interface RawSnapshot {
-  in_flight: { id: string; kind: string; state: string; repo: string; name: string; doing: string }[];
+  in_flight: {
+    id: string;
+    kind: string;
+    state: string;
+    repo: string;
+    name: string;
+    doing: string;
+  }[];
   decisions_open: { id: string; summary: string }[];
   landed: { id: string; what: string; artifact: string }[];
   gates: { id?: string; title?: string; reason?: string }[];
