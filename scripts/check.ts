@@ -170,17 +170,21 @@ else console.log("  skip no open decision, so the 422 case was not exercised");
 
 // parsers, against fixed samples
 const reason =
-  "Intro text. ## Engine :: Stub (Recommended) | Real OpenAI | Later ## Flag :: Set it (Recommended) | Preview | Off";
+  "Intro text. ## Engine :: Stub (Recommended) | Real OpenAI | Later ## Flag :: Set it (Recommended) | Preview | Off ## Many :: A | B | C | D | E";
 const questions = parseQuestions(reason).map((q, i) => ({ number: i + 1, ...q }));
 const sampleDecision = {
   id: "sample",
   title: "Sample",
-  summary: "2 questions to answer. The recommended option is marked.",
+  summary: "3 questions to answer. The recommended option is marked.",
   questions,
   text: null,
 };
 const decisionProblem = validator("Decision")(sampleDecision);
-if (questions.length !== 2 || questions[0]?.options.filter((o) => o.recommended).length !== 1)
+if (
+  questions.length !== 3 ||
+  questions[0]?.options.filter((o) => o.recommended).length !== 1 ||
+  questions[2]?.options.length !== 4
+)
   bad("parseQuestions sample");
 else if (decisionProblem) bad(`sample Decision: ${decisionProblem}`);
 else ok("parseQuestions output matches the Decision schema");

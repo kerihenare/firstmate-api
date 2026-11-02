@@ -231,7 +231,8 @@ export function parseQuestions(reason: string): ParsedQuestion[] {
         text: o.replace(/\s*\(recommended\)/i, "").trim(),
         recommended: /\(recommended\)/i.test(o),
       }));
-    if (title && options.length > 0) out.push({ title, options });
+    // The spec allows at most 4 options; extras are dropped (the answer can still be free text).
+    if (title && options.length > 0) out.push({ title, options: options.slice(0, 4) });
   }
   return out;
 }

@@ -67,6 +67,8 @@ function run(
       },
     );
     if (opts.input !== undefined) {
+      // EPIPE when the child exits before reading; the exit code already reports the failure.
+      child.stdin?.on("error", () => {});
       child.stdin?.end(opts.input);
     }
   });
@@ -88,8 +90,7 @@ async function readMeta(taskId: string): Promise<Record<string, string>> {
   return meta;
 }
 
-async function pipelineFor(taskId: string): Promise<Pipeline | null> {
-  const meta = await readMeta(taskId);
+async function pipelineFor(meta: Record<string, string>): Promise<Pipeline | null> {
   if (meta["mode"] !== "no-mistakes" || !meta["worktree"]) return null;
   try {
     await stat(meta["worktree"]);
@@ -132,8 +133,12 @@ function prNumber(url: string): number | null {
   return m && m[1] ? Number(m[1]) : null;
 }
 
-async function linksFor(taskId: string, title: string, recordedPr: string): Promise<TaskLinks> {
-  const meta = await readMeta(taskId);
+async function linksFor(
+  taskId: string,
+  meta: Record<string, string>,
+  title: string,
+  recordedPr: string,
+): Promise<TaskLinks> {
   let pr = recordedPr || meta["pr"] || "";
   if (!pr && meta["branch"] && meta["project"]) {
     const slug = await repoSlug(meta["project"]);
@@ -218,6 +223,48 @@ function taskKind(kind: string): Task["kind"] {
   return kind === "ship" || kind === "scout" ? kind : "other";
 }
 
+/** Like Promise.all over items.map(fn), but with at most `limit` calls in flight. */
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = [];
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i] as T);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
+/** Each task spawns up to four processes, so this caps a refresh at about 4 × TASK_CONCURRENCY. */
+const TASK_CONCURRENCY = 4;
+
+interface TaskInfo {
+  crew: string;
+  links: TaskLinks | null;
+  pipeline: Pipeline | null;
+}
+
+/** Crew line for any task; pipeline and links only for tasks in flight (title given). */
+async function taskInfo(
+  taskId: string,
+  title: string | undefined,
+  recordedPr: string,
+): Promise<TaskInfo> {
+  const meta = await readMeta(taskId);
+  const [crew, pipeline, links] = await Promise.all([
+    crewLine(taskId),
+    title === undefined ? null : pipelineFor(meta),
+    title === undefined ? null : linksFor(taskId, meta, title, recordedPr),
+  ]);
+  return { crew, links, pipeline };
+}
+
 async function build(): Promise<Bearings> {
   const snap = await run(bin("fm-bearings-snapshot.sh"), ["--json"], { timeoutMs: 150_000 });
   if (snap.code !== 0 || !snap.stdout.trim())
@@ -226,27 +273,19 @@ async function build(): Promise<Bearings> {
   const recordedPr = new Map(raw.recorded_prs.map((p) => [p.id, p.url]));
   const names = new Map(raw.in_flight.map((t) => [t.id, t.name]));
 
-  const ids = [
-    ...new Set([...raw.in_flight.map((t) => t.id), ...raw.recorded_prs.map((p) => p.id)]),
-  ];
-  const crew = new Map(await Promise.all(ids.map(async (id) => [id, await crewLine(id)] as const)));
-  const pipelines = new Map(
-    await Promise.all(ids.map(async (id) => [id, await pipelineFor(id)] as const)),
-  );
-  const links = new Map(
-    await Promise.all(
-      raw.in_flight.map(
-        async (t) => [t.id, await linksFor(t.id, t.name, recordedPr.get(t.id) ?? "")] as const,
-      ),
-    ),
-  );
-  const holds = new Map(
-    await Promise.all(raw.decisions_open.map(async (d) => [d.id, await holdReason(d.id)] as const)),
-  );
+  const ids = [...new Set([...names.keys(), ...raw.recorded_prs.map((p) => p.id)])];
+  const [infoList, holdList, activity] = await Promise.all([
+    mapLimit(ids, TASK_CONCURRENCY, (id) => taskInfo(id, names.get(id), recordedPr.get(id) ?? "")),
+    mapLimit(raw.decisions_open, TASK_CONCURRENCY, (d) => holdReason(d.id)),
+    activityFeed(names),
+  ]);
+  const info = new Map(ids.map((id, i) => [id, infoList[i]]));
+  const holds = new Map(raw.decisions_open.map((d, i) => [d.id, holdList[i] ?? ""]));
 
   const underway: Task[] = raw.in_flight.map((t) => {
-    const line = crew.get(t.id) || t.doing;
-    const pipeline = pipelines.get(t.id) ?? null;
+    const i = info.get(t.id);
+    const line = i?.crew || t.doing;
+    const pipeline = i?.pipeline ?? null;
     const { state, sentence } = describeTask(line, pipeline, readyForReview(line));
     return {
       id: t.id,
@@ -255,7 +294,7 @@ async function build(): Promise<Bearings> {
       kind: taskKind(t.kind),
       state,
       status: sentence,
-      links: links.get(t.id) ?? { linear: null, pullRequest: null },
+      links: i?.links ?? { linear: null, pullRequest: null },
       pipeline,
     };
   });
@@ -279,7 +318,7 @@ async function build(): Promise<Bearings> {
   const landedUrls = new Set(raw.landed.map((l) => l.artifact));
   const readyToMerge: ReadyToMerge[] = [];
   for (const p of raw.recorded_prs) {
-    if (landedUrls.has(p.url) || !readyForReview(crew.get(p.id) ?? "")) continue;
+    if (landedUrls.has(p.url) || !readyForReview(info.get(p.id)?.crew ?? "")) continue;
     const number = prNumber(p.url);
     if (number === null) continue;
     readyToMerge.push({
@@ -321,7 +360,7 @@ async function build(): Promise<Bearings> {
     underway,
     recentlyLanded: landed,
     queued,
-    activity: await activityFeed(names),
+    activity,
     contributions: {
       known: raw.contributions.known,
       checked: raw.contributions.checked,
@@ -336,7 +375,10 @@ let current: Bearings | null = null;
 let generatedMs = 0;
 let refreshing = false;
 let lastError: string | null = null;
+let nextMs = 0;
+let timer: ReturnType<typeof setTimeout> | undefined;
 
+/** Rebuild now. Every finished rebuild, scheduled or manual, schedules the next one a full interval later. */
 export async function refresh(): Promise<void> {
   if (refreshing) return;
   refreshing = true;
@@ -348,12 +390,15 @@ export async function refresh(): Promise<void> {
     lastError = e instanceof Error ? e.message.slice(0, 300) : "refresh failed";
   } finally {
     refreshing = false;
+    clearTimeout(timer);
+    nextMs = Date.now() + REFRESH_SECONDS * 1000;
+    timer = setTimeout(() => void refresh(), REFRESH_SECONDS * 1000);
+    timer.unref();
   }
 }
 
 export function startRefreshLoop(): void {
   void refresh();
-  setInterval(() => void refresh(), REFRESH_SECONDS * 1000).unref();
 }
 
 /** The latest bearings, or null before the first refresh finishes. */
@@ -362,7 +407,7 @@ export function getBearings(): Bearings | null {
   return {
     ...current,
     generatedAt: new Date(generatedMs).toISOString(),
-    nextRefreshAt: new Date(generatedMs + REFRESH_SECONDS * 1000).toISOString(),
+    nextRefreshAt: refreshing ? null : new Date(nextMs).toISOString(),
     refreshing,
     error: lastError,
   };
