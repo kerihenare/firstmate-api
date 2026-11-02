@@ -78,6 +78,7 @@ const command = z.string().trim();
  */
 function wholeNumber(min: number, max: number): z.ZodType<number, string> {
   const error = `must be a whole number from ${min} to ${max}`;
+
   return z
     .string()
     .trim()
@@ -128,11 +129,14 @@ const EnvSchema = z.object({
  */
 export function parseSettings(env: Record<string, string | undefined>): Settings {
   const result = EnvSchema.safeParse(env);
+
   if (!result.success) {
     const problems = result.error.issues.map((issue) => `${issue.path.join(".")} ${issue.message}`);
     throw new Error(`Bad settings: ${problems.join("; ")}.`);
   }
+
   const vars = result.data;
+
   return {
     allowedHosts: vars.BEARINGS_API_ALLOWED_HOSTS,
     apiKey: vars.BEARINGS_API_KEY,

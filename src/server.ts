@@ -98,6 +98,7 @@ type JsonBody =
  */
 function routeId(c: Context): string | undefined {
   const parsed = IdSchema.safeParse(c.req.param("id"));
+
   return parsed.success ? parsed.data : undefined;
 }
 
@@ -121,15 +122,18 @@ async function readJson(c: Context): Promise<JsonBody> {
 
   const chunks: Uint8Array[] = [];
   let size = 0;
+
   for await (const chunk of c.req.raw.body ?? []) {
     size += chunk.byteLength;
     if (size > MAX_BODY_BYTES) {
       return { code: "too_large", message: "The body is too large.", ok: false, status: 413 };
     }
+
     chunks.push(chunk);
   }
 
   const text = Buffer.concat(chunks).toString("utf8");
+
   try {
     return { ok: true, value: JSON.parse(text || "null") as unknown };
   } catch {
@@ -146,6 +150,7 @@ async function readJson(c: Context): Promise<JsonBody> {
 function hostOk(c: Context): boolean {
   const host = (c.req.header("host") ?? "").toLowerCase();
   const name = host.startsWith("[") ? `${host.split("]")[0]}]` : host.replace(/:\d+$/, "");
+
   return ALLOWED_HOSTS.has(name);
 }
 
@@ -162,10 +167,14 @@ function isRead(c: Context): boolean {
  * guessed one character at a time.
  */
 function keyOk(c: Context): boolean {
-  if (!API_KEY) return true;
+  if (!API_KEY) {
+    return true;
+  }
+
   const given = /^Bearer (.+)$/.exec(c.req.header("authorization") ?? "")?.[1] ?? "";
   const givenBytes = Buffer.from(given);
   const keyBytes = Buffer.from(API_KEY);
+
   return givenBytes.length === keyBytes.length && timingSafeEqual(givenBytes, keyBytes);
 }
 
@@ -178,7 +187,10 @@ function keyOk(c: Context): boolean {
  */
 function originOk(c: Context): boolean {
   const origin = c.req.header("origin");
-  if (origin === undefined) return true;
+
+  if (origin === undefined) {
+    return true;
+  }
   try {
     return ALLOWED_HOSTS.has(new URL(origin).hostname.toLowerCase());
   } catch {
@@ -195,12 +207,18 @@ function originOk(c: Context): boolean {
 async function deliver(c: Context, write: () => Promise<AnswerOutcome>): Promise<Response> {
   try {
     const outcome = await write();
-    if (!outcome.ok) return fail(c, outcome.status, outcome.code, outcome.message);
+
+    if (!outcome.ok) {
+      return fail(c, outcome.status, outcome.code, outcome.message);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : "The note could not be recorded.";
+
     return fail(c, 502, "note_failed", message);
   }
+
   const receipt: NoteReceipt = { accepted: true, receivedAt: new Date().toISOString() };
+
   return c.json(receipt, 202);
 }
 
@@ -213,6 +231,7 @@ async function deliver(c: Context, write: () => Promise<AnswerOutcome>): Promise
  */
 function fail(c: Context, status: ErrorStatus, code: string, message: string): Response {
   const body: ApiError = { error: { code, message } };
+
   return c.json(body, status);
 }
 
@@ -222,6 +241,7 @@ function notReady(c: Context): Response {
   const message = error
     ? `The first snapshot failed and will be retried shortly: ${error}`
     : "The first snapshot is still being built. Retry shortly.";
+
   return fail(c, 503, "not_ready", message);
 }
 
@@ -233,6 +253,7 @@ function notReady(c: Context): Response {
  */
 function withBearings(c: Context, respond: (bearings: Bearings) => Response): Response {
   const bearings = getBearings();
+
   return bearings ? respond(bearings) : notReady(c);
 }
 
@@ -240,13 +261,19 @@ function withBearings(c: Context, respond: (bearings: Bearings) => Response): Re
 
 /** Refuse requests whose Host header is not an allowed host name (421). */
 const checkHost: MiddlewareHandler = async (c, next) => {
-  if (!hostOk(c)) return fail(c, 421, "bad_host", "Use localhost to reach this API.");
+  if (!hostOk(c)) {
+    return fail(c, 421, "bad_host", "Use localhost to reach this API.");
+  }
+
   await next();
 };
 
 /** Refuse requests without the API key (401), when one is set. */
 const checkKey: MiddlewareHandler = async (c, next) => {
-  if (!keyOk(c)) return fail(c, 401, "unauthorized", "Send the API key as a bearer token.");
+  if (!keyOk(c)) {
+    return fail(c, 401, "unauthorized", "Send the API key as a bearer token.");
+  }
+
   await next();
 };
 
@@ -255,6 +282,7 @@ const checkOrigin: MiddlewareHandler = async (c, next) => {
   if (!isRead(c) && !originOk(c)) {
     return fail(c, 403, "bad_origin", "Writes from other sites are not allowed.");
   }
+
   await next();
 };
 
@@ -280,6 +308,7 @@ app.get("/health", (c) => {
   const health = status();
   // The error text can name local paths, so only callers with the key see it.
   const error = health.error && !keyOk(c) ? "refresh failed" : health.error;
+
   return c.json({ ok: true, ...health, error });
 });
 
@@ -288,6 +317,7 @@ app.use(checkKey);
 
 app.get("/api/v1/activity", (c) => {
   const limit = ActivityLimitSchema.safeParse(c.req.query("limit"));
+
   if (!limit.success) {
     return fail(
       c,
@@ -296,6 +326,7 @@ app.get("/api/v1/activity", (c) => {
       `limit must be a whole number from 1 to ${ACTIVITY_LIMIT}.`,
     );
   }
+
   return withBearings(c, (bearings) => c.json(bearings.activity.slice(0, limit.data)));
 });
 
@@ -305,22 +336,31 @@ app.get("/api/v1/questions", (c) => withBearings(c, (bearings) => c.json(bearing
 
 app.get("/api/v1/questions/:id", (c) => {
   const decisionId = routeId(c);
-  if (!decisionId) return c.notFound();
+
+  if (!decisionId) {
+    return c.notFound();
+  }
+
   return withBearings(c, (bearings) => {
     const decision = bearings.waitingOnYou.decisions.find((d) => d.id === decisionId);
+
     if (!decision) {
       return fail(c, 404, "decision_not_found", `No open decision with id "${decisionId}".`);
     }
+
     return c.json(decision);
   });
 });
 
 app.get("/api/v1/tasks", (c) => {
   const parsed = TaskStateFilterSchema.safeParse(c.req.query("state"));
+
   if (!parsed.success) {
     return fail(c, 400, "invalid_state", `state must be one of: ${TASK_STATES.join(", ")}.`);
   }
+
   const state = parsed.data;
+
   return withBearings(c, (bearings) =>
     c.json(state ? bearings.underway.filter((task) => task.state === state) : bearings.underway),
   );
@@ -328,44 +368,76 @@ app.get("/api/v1/tasks", (c) => {
 
 app.get("/api/v1/tasks/:id", (c) => {
   const taskId = routeId(c);
-  if (!taskId) return c.notFound();
+
+  if (!taskId) {
+    return c.notFound();
+  }
+
   return withBearings(c, (bearings) => {
     const task = bearings.underway.find((t) => t.id === taskId);
-    if (!task) return fail(c, 404, "task_not_found", `No task under way with id "${taskId}".`);
+
+    if (!task) {
+      return fail(c, 404, "task_not_found", `No task under way with id "${taskId}".`);
+    }
+
     return c.json(task);
   });
 });
 
 app.post("/api/v1/notes", async (c) => {
   const body = await readJson(c);
-  if (!body.ok) return fail(c, body.status, body.code, body.message);
+
+  if (!body.ok) {
+    return fail(c, body.status, body.code, body.message);
+  }
+
   const request = NoteRequestSchema.safeParse(body.value);
-  if (!request.success) return fail(c, 400, "invalid_body", 'Expected {"text":"..."}.');
+
+  if (!request.success) {
+    return fail(c, 400, "invalid_body", 'Expected {"text":"..."}.');
+  }
+
   return deliver(c, async () => {
     await sendGeneralNote(request.data.text);
+
     return { ok: true };
   });
 });
 
 app.post("/api/v1/questions/:id/answers", async (c) => {
   const answersFor = routeId(c);
-  if (!answersFor) return c.notFound();
+
+  if (!answersFor) {
+    return c.notFound();
+  }
   // Answers are checked against the open decisions, so there must be a snapshot.
-  if (!getBearings()) return notReady(c);
+  if (!getBearings()) {
+    return notReady(c);
+  }
+
   const body = await readJson(c);
-  if (!body.ok) return fail(c, body.status, body.code, body.message);
+
+  if (!body.ok) {
+    return fail(c, body.status, body.code, body.message);
+  }
+
   const request = AnswerRequestSchema.safeParse(body.value);
+
   if (!request.success) {
     const expected =
       'Expected {"answers":[{"question":1,"answer":"..."}]}, with each question answered once.';
+
     return fail(c, 400, "invalid_body", expected);
   }
+
   return deliver(c, () => sendAnswers(answersFor, request.data));
 });
 
 app.post("/api/v1/refresh", (c) => {
   refreshInBackground();
+
   const receipt: RefreshReceipt = { accepted: true };
+
   return c.json(receipt, 202);
 });
 
@@ -373,6 +445,7 @@ app.notFound((c) => fail(c, 404, "not_found", "No such endpoint. See /docs."));
 
 app.onError((error, c) => {
   console.error(`${c.req.method} ${c.req.url} failed:`, error);
+
   return fail(c, 500, "internal_error", "Something went wrong.");
 });
 

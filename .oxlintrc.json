@@ -5,7 +5,13 @@
     "correctness": "error"
   },
   "rules": {
-    "jsdoc/check-tag-names": ["error", { "typed": true }],
+    "curly": ["error", "all"],
+    "jsdoc/check-tag-names": [
+      "error",
+      {
+        "typed": true
+      }
+    ],
     "jsdoc/empty-tags": "error",
     "jsdoc/no-defaults": "error",
     "jsdoc/require-param-description": "error",

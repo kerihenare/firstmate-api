@@ -112,6 +112,7 @@ function describeCrewLine(crewLine: string): TaskDescription {
     case "Working":
       return { sentence: summary || "Working on it.", state: "working" };
   }
+
   return { sentence: summary || word || "Status not available yet.", state: "unknown" };
 }
 
@@ -132,8 +133,10 @@ function describePipeline(pipeline: Pipeline): TaskDescription | null {
   }
 
   const failedStep = steps.find((step) => step.status === "failed");
+
   if (status === "failed" || failedStep) {
     const where = failedStep ? STEP_PLAIN[failedStep.name] : "a step";
+
     return { sentence: `Validation failed at ${where}.`, state: "failed" };
   }
 
@@ -148,6 +151,7 @@ function describePipeline(pipeline: Pipeline): TaskDescription | null {
     (step) => step.status === "completed" || step.status === "skipped",
   ).length;
   const activeStep = steps.find((step) => step.status === "running" || step.status === "fixing");
+
   if (activeStep) {
     return {
       sentence: `Running ${STEP_PLAIN[activeStep.name]}, ${doneCount} of ${steps.length} steps done.`,
@@ -157,6 +161,7 @@ function describePipeline(pipeline: Pipeline): TaskDescription | null {
   if (doneCount === steps.length) {
     return { sentence: "All validation steps are done.", state: "finished" };
   }
+
   return null;
 }
 
@@ -178,16 +183,25 @@ export function describeTask(
   pipeline: Pipeline | null,
   ready: boolean,
 ): TaskDescription {
-  if (ready) return { sentence: "Ready for you to review and merge.", state: "ready_for_review" };
+  if (ready) {
+    return { sentence: "Ready for you to review and merge.", state: "ready_for_review" };
+  }
+
   const fromPipeline = pipeline ? describePipeline(pipeline) : null;
+
   return fromPipeline ?? describeCrewLine(crewLine);
 }
 
 /** Turn a row of the `gate.findings` table into a {@link Finding}, or `null` if it has no id. */
 function findingFromRow(cell: CellReader): Finding | null {
   const id = cell("id");
-  if (!id) return null;
+
+  if (!id) {
+    return null;
+  }
+
   const severity = cell("severity");
+
   return {
     id,
     severity: severity === "error" || severity === "warning" ? severity : "info",
@@ -215,8 +229,14 @@ export function firstSentence(text: string, max = 140): string {
     .replace(/^[\s\-·:]+|[\s\-·:]+$/g, "");
   const match = /^(.{20,}?[.!?])(\s|$)/.exec(cleaned);
   let sentence = match?.[1] ?? cleaned;
-  if (sentence.length > max) sentence = `${sentence.slice(0, max).replace(/\s+\S*$/, "")}…`;
-  if (sentence && !/[.!?…]$/.test(sentence)) sentence += ".";
+
+  if (sentence.length > max) {
+    sentence = `${sentence.slice(0, max).replace(/\s+\S*$/, "")}…`;
+  }
+  if (sentence && !/[.!?…]$/.test(sentence)) {
+    sentence += ".";
+  }
+
   return sentence ? sentence.charAt(0).toUpperCase() + sentence.slice(1) : "";
 }
 
@@ -235,7 +255,10 @@ export function firstSentence(text: string, max = 140): string {
  *   150 characters.
  */
 export function friendly(line: string): { body: string; word: string } {
-  if (!line) return { body: "", word: "" };
+  if (!line) {
+    return { body: "", word: "" };
+  }
+
   const state = /^state: (\w+)/.exec(line)?.[1];
   const word = state ? (STATE_WORD[state] ?? state) : "";
   const body = line
@@ -250,6 +273,7 @@ export function friendly(line: string): { body: string; word: string } {
     .replace("checks green: PR ready for review", "Checks green, ready for review")
     .replace(/\s+/g, " ")
     .replace(/^[\s:·]+|[\s:·]+$/g, "");
+
   return { body: body.slice(0, 150), word };
 }
 
@@ -302,30 +326,48 @@ export function parsePipeline(raw: string): Pipeline | null {
       table = header?.[1] ? `${section}.${header[1]}` : "";
       columns = header?.[2] ? header[2].split(",") : [];
       const field = /^ {2}(\w+): "?(.*?)"?$/.exec(line);
-      if (field?.[1] && field[2] !== undefined) fields[`${section}.${field[1]}`] = field[2];
+
+      if (field?.[1] && field[2] !== undefined) {
+        fields[`${section}.${field[1]}`] = field[2];
+      }
       continue;
     }
 
     // A four-space line inside a table is one row.
-    if (!table || !/^ {4}\S/.test(line)) continue;
+    if (!table || !/^ {4}\S/.test(line)) {
+      continue;
+    }
+
     const cells = splitRow(line.slice(4));
     const cell: CellReader = (column) => (cells[columns.indexOf(column)] ?? "").trim();
+
     if (table === "run.steps") {
       const step = stepFromRow(cell);
-      if (step) steps.push(step);
+
+      if (step) {
+        steps.push(step);
+      }
     }
     if (table === "gate.findings") {
       const finding = findingFromRow(cell);
-      if (finding) findings.push(finding);
+
+      if (finding) {
+        findings.push(finding);
+      }
     }
   }
 
   const runId = fields["run.id"] ?? "";
-  if (steps.length === 0 || !runId) return null;
+
+  if (steps.length === 0 || !runId) {
+    return null;
+  }
+
   const gateStep = fields["gate.step"] ?? "";
   const gate = STEP_NAME_SET.has(gateStep)
     ? { status: fields["gate.status"] ?? "", step: gateStep as StepName }
     : null;
+
   return {
     findings,
     gate,
@@ -357,9 +399,14 @@ export function parsePipeline(raw: string): Pipeline | null {
  */
 export function parseQuestions(reason: string): ParsedQuestion[] {
   const questions: ParsedQuestion[] = [];
+
   for (const chunk of reason.split(" ## ")) {
     const separator = chunk.indexOf("::");
-    if (separator === -1) continue;
+
+    if (separator === -1) {
+      continue;
+    }
+
     const title = chunk
       .slice(0, separator)
       // Drop anything up to a `##` the split missed, as when the reason starts with `## `.
@@ -374,10 +421,12 @@ export function parseQuestions(reason: string): ParsedQuestion[] {
         recommended: /\(recommended\)/i.test(option),
         text: option.replace(/\s*\(recommended\)/i, "").trim(),
       }));
+
     if (title && options.length > 0) {
       questions.push({ options: options.slice(0, MAX_OPTIONS), title });
     }
   }
+
   return questions;
 }
 
@@ -396,13 +445,19 @@ export function parseQuestions(reason: string): ParsedQuestion[] {
  */
 export function parseSnapshot(text: string): RawSnapshot {
   let value: unknown;
+
   try {
     value = JSON.parse(text);
   } catch {
     throw new Error("The snapshot script printed something that is not JSON.");
   }
+
   const result = RawSnapshotSchema.safeParse(value);
-  if (result.success) return result.data;
+
+  if (result.success) {
+    return result.data;
+  }
+
   const issue = result.error.issues[0];
   throw new Error(issue ? snapshotProblem(issue) : "The snapshot is not valid.");
 }
@@ -440,8 +495,14 @@ export function readyForReview(crewLine: string): boolean {
  */
 function snapshotProblem(issue: z.core.$ZodIssue): string {
   const [listName, index] = issue.path;
-  if (listName === "contributions") return `The snapshot's "contributions" ${issue.message}.`;
-  if (listName === undefined || index === undefined) return `The snapshot ${issue.message}.`;
+
+  if (listName === "contributions") {
+    return `The snapshot's "contributions" ${issue.message}.`;
+  }
+  if (listName === undefined || index === undefined) {
+    return `The snapshot ${issue.message}.`;
+  }
+
   return `The snapshot's ${String(listName)}[${String(index)}] ${issue.message}.`;
 }
 
@@ -477,8 +538,10 @@ export function splitRow(row: string): string[] {
   const cells: string[] = [];
   let cell = "";
   let quoted = false;
+
   for (let i = 0; i < row.length; i++) {
     const char = row.charAt(i);
+
     if (quoted && char === "\\" && i + 1 < row.length) {
       i++;
       cell += row.charAt(i);
@@ -491,15 +554,22 @@ export function splitRow(row: string): string[] {
       cell += char;
     }
   }
+
   cells.push(cell);
+
   return cells;
 }
 
 /** Turn a row of the `run.steps` table into a {@link PipelineStep}, or `null` for unknown steps. */
 function stepFromRow(cell: CellReader): PipelineStep | null {
   const name = cell("step");
-  if (!STEP_NAME_SET.has(name)) return null;
+
+  if (!STEP_NAME_SET.has(name)) {
+    return null;
+  }
+
   const status = cell("status");
+
   return {
     findings: Number(cell("findings")) || 0,
     name: name as StepName,
@@ -521,6 +591,9 @@ function stepFromRow(cell: CellReader): PipelineStep | null {
  * @returns The key, or `""` when none matches or `teams` is empty.
  */
 export function ticketKey(text: string, teams: string[]): string {
-  if (teams.length === 0) return "";
+  if (teams.length === 0) {
+    return "";
+  }
+
   return new RegExp(`\\b(?:${teams.join("|")})-\\d+\\b`).exec(text)?.[0] ?? "";
 }

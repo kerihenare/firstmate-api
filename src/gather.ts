@@ -200,6 +200,7 @@ interface TaskInfo {
 async function activityFeed(names: Map<string, string>): Promise<ActivityEvent[]> {
   const stateDir = path.join(FM_HOME, "state");
   let files: string[];
+
   try {
     files = (await readdir(stateDir)).filter((file) => file.endsWith(".status"));
   } catch {
@@ -208,18 +209,28 @@ async function activityFeed(names: Map<string, string>): Promise<ActivityEvent[]
 
   const events: ActivityEvent[] = [];
   const now = Date.now();
+
   for (const file of files) {
     const filePath = path.join(stateDir, file);
     const taskId = file.slice(0, -".status".length);
+
     try {
-      if (now - (await stat(filePath)).mtimeMs > ACTIVITY_MAX_AGE_MS) continue;
+      if (now - (await stat(filePath)).mtimeMs > ACTIVITY_MAX_AGE_MS) {
+        continue;
+      }
+
       const lines = (await readFile(filePath, "utf8")).split("\n").slice(-ACTIVITY_TAIL_LINES);
+
       for (const line of lines) {
         // prefix, then zero or more ` [key=value]` tags, then `: text`.
         const match = /^([\w-]+)((?: \[[^\]]+\])*):\s*(.*)$/.exec(line);
         const kind = match?.[1] ? EVENT_KIND[match[1]] : undefined;
         const atSeconds = match?.[2] ? /\[at=(\d+)\]/.exec(match[2])?.[1] : undefined;
-        if (!kind || !atSeconds) continue;
+
+        if (!kind || !atSeconds) {
+          continue;
+        }
+
         events.push({
           at: new Date(Number(atSeconds) * 1000).toISOString(),
           kind,
@@ -232,7 +243,9 @@ async function activityFeed(names: Map<string, string>): Promise<ActivityEvent[]
       // The file vanished or is unreadable; leave its events out.
     }
   }
+
   events.sort((a, b) => b.at.localeCompare(a.at));
+
   return events.slice(0, ACTIVITY_LIMIT);
 }
 
@@ -302,6 +315,7 @@ async function build(): Promise<Bearings> {
 async function crewLine(taskId: string): Promise<string> {
   const result = await run(bin("fm-crew-state.sh"), [taskId], { timeoutMs: 30_000 });
   const firstLine = (result.stdout || result.stderr).trim().split("\n")[0] ?? "";
+
   return firstLine.slice(0, 400);
 }
 
@@ -319,11 +333,21 @@ function findReadyToMerge(
 ): ReadyToMerge[] {
   const landedUrls = new Set(raw.landed.map((item) => item.artifact));
   const ready: ReadyToMerge[] = [];
+
   for (const pr of raw.recorded_prs) {
-    if (landedUrls.has(pr.url)) continue;
-    if (!readyForReview(infoById.get(pr.id)?.crew ?? "")) continue;
+    if (landedUrls.has(pr.url)) {
+      continue;
+    }
+    if (!readyForReview(infoById.get(pr.id)?.crew ?? "")) {
+      continue;
+    }
+
     const number = prNumber(pr.url);
-    if (number === null) continue;
+
+    if (number === null) {
+      continue;
+    }
+
     ready.push({
       name: names.get(pr.id) ?? pr.id,
       pullRequest: { number, url: pr.url },
@@ -331,6 +355,7 @@ function findReadyToMerge(
       taskId: pr.id,
     });
   }
+
   return ready;
 }
 
@@ -338,6 +363,7 @@ function findReadyToMerge(
 async function holdReason(taskId: string): Promise<string> {
   const result = await run(bin("fm-tasks-axi.sh"), ["show", taskId], { timeoutMs: 30_000 });
   const reason = /hold_reason: "?(.*?)"?$/m.exec(result.stdout)?.[1];
+
   return reason && reason !== "-" ? reason : "";
 }
 
@@ -352,17 +378,25 @@ async function holdReason(taskId: string): Promise<string> {
  */
 function killGroup(child: ChildProcess): void {
   const pid = child.pid;
-  if (pid === undefined) return;
+
+  if (pid === undefined) {
+    return;
+  }
+
   /** Signal the group. False when it is already gone. */
   const signalGroup = (signal: NodeJS.Signals): boolean => {
     try {
       process.kill(-pid, signal);
+
       return true;
     } catch {
       return false;
     }
   };
-  if (signalGroup("SIGTERM")) setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS).unref();
+
+  if (signalGroup("SIGTERM")) {
+    setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS).unref();
+  }
 }
 
 /**
@@ -386,9 +420,13 @@ async function linksFor(
 ): Promise<TaskLinks> {
   let prUrl = recordedPr || meta.pr || "";
   const { branch, project } = meta;
-  if (!prUrl && branch && project) prUrl = await openPrForBranch(project, branch);
+
+  if (!prUrl && branch && project) {
+    prUrl = await openPrForBranch(project, branch);
+  }
 
   let key = "";
+
   if (LINEAR_BASE && LINEAR_TEAMS.length > 0) {
     key = ticketKey(title, LINEAR_TEAMS);
     if (!key) {
@@ -400,6 +438,7 @@ async function linksFor(
   }
 
   const number = prUrl ? prNumber(prUrl) : null;
+
   return {
     linear: key ? { key, url: LINEAR_BASE + key } : null,
     pullRequest: number === null ? null : { number, url: prUrl },
@@ -427,7 +466,9 @@ async function mapLimit<T, R>(
       results[index] = await fn(items[index] as T);
     }
   };
+
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+
   return results;
 }
 
@@ -437,12 +478,17 @@ async function mapLimit<T, R>(
  */
 async function openPrForBranch(projectDir: string, branch: string): Promise<string> {
   const slug = await repoSlug(projectDir);
-  if (!slug) return "";
+
+  if (!slug) {
+    return "";
+  }
+
   const args = ["pr", "list", "-R", slug, "--head", branch, "--state", "open"];
   const result = await run(GH, [...args, "--json", "url", "--jq", ".[0].url"], {
     timeoutMs: 25_000,
   });
   const url = result.stdout.trim();
+
   return result.code === 0 && url.startsWith("http") ? url : "";
 }
 
@@ -454,19 +500,25 @@ async function openPrForBranch(projectDir: string, branch: string): Promise<stri
  */
 async function pipelineFor(meta: TaskMeta): Promise<Pipeline | null> {
   const { worktree } = meta;
-  if (meta.mode !== "no-mistakes" || !worktree) return null;
+
+  if (meta.mode !== "no-mistakes" || !worktree) {
+    return null;
+  }
   try {
     await stat(worktree);
   } catch {
     return null;
   }
+
   const result = await run(NO_MISTAKES, ["axi", "status"], { cwd: worktree, timeoutMs: 40_000 });
+
   return result.stdout ? parsePipeline(result.stdout) : null;
 }
 
 /** The number in a GitHub pull request URL, or `null` when the URL is not a pull request. */
 function prNumber(url: string): number | null {
   const digits = /\/pull\/(\d+)/.exec(url)?.[1];
+
   return digits ? Number(digits) : null;
 }
 
@@ -479,6 +531,7 @@ function prNumber(url: string): number | null {
 async function readMeta(taskId: string): Promise<TaskMeta> {
   const pairs: Record<string, string> = {};
   let text: string;
+
   try {
     text = await readFile(path.join(FM_HOME, "state", `${taskId}.meta`), "utf8");
   } catch {
@@ -486,8 +539,12 @@ async function readMeta(taskId: string): Promise<TaskMeta> {
   }
   for (const line of text.split("\n")) {
     const equals = line.indexOf("=");
-    if (equals > 0) pairs[line.slice(0, equals)] = line.slice(equals + 1);
+
+    if (equals > 0) {
+      pairs[line.slice(0, equals)] = line.slice(equals + 1);
+    }
   }
+
   return TaskMetaSchema.parse(pairs);
 }
 
@@ -499,22 +556,32 @@ async function readMeta(taskId: string): Promise<TaskMeta> {
  */
 async function readSnapshot(): Promise<RawSnapshot> {
   const result = await run(bin("fm-bearings-snapshot.sh"), ["--json"], { timeoutMs: 150_000 });
+
   if (result.code !== 0 || !result.stdout.trim()) {
     throw new Error((result.stderr || "snapshot failed").trim().slice(0, 300));
   }
+
   return parseSnapshot(result.stdout);
 }
 
 /** The GitHub `owner/name` of a project's `origin` remote, or `""` when it is not on GitHub. */
 async function repoSlug(projectDir: string): Promise<string> {
   const cached = repoSlugCache.get(projectDir);
-  if (cached !== undefined) return cached;
+
+  if (cached !== undefined) {
+    return cached;
+  }
+
   const result = await run(GIT, ["-C", projectDir, "remote", "get-url", "origin"], {
     timeoutMs: 10_000,
   });
   const slug = slugFromRemote(result.stdout);
+
   // Only cache a real answer, so a timeout is retried on the next refresh.
-  if (result.code === 0) repoSlugCache.set(projectDir, slug);
+  if (result.code === 0) {
+    repoSlugCache.set(projectDir, slug);
+  }
+
   return slug;
 }
 
@@ -545,7 +612,9 @@ function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunRes
     let settled = false;
 
     const stop = (reason: string): void => {
-      if (stoppedBecause) return;
+      if (stoppedBecause) {
+        return;
+      }
       stoppedBecause = reason;
       killGroup(child);
     };
@@ -555,19 +624,27 @@ function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunRes
       (into: Buffer[]) =>
       (chunk: Buffer): void => {
         outputBytes += chunk.length;
-        if (outputBytes > MAX_OUTPUT_BYTES) return stop("printed too much output");
+        if (outputBytes > MAX_OUTPUT_BYTES) {
+          return stop("printed too much output");
+        }
+
         into.push(chunk);
       };
+
     child.stdout?.on("data", collect(stdout));
     child.stderr?.on("data", collect(stderr));
 
     /** Resolve once, whichever of `error` and `close` comes first. */
     const finish = (code: number, reason: string): void => {
-      if (settled) return;
+      if (settled) {
+        return;
+      }
       settled = true;
       clearTimeout(timer);
+
       const errorText = stripVTControlCharacters(Buffer.concat(stderr).toString("utf8"));
       const stopped = stoppedBecause ? `${path.basename(cmd)} ${stoppedBecause}.` : "";
+
       resolve({
         code: stoppedBecause ? 1 : code,
         // A missing binary or a timeout leaves stderr empty, so give the reason instead.
@@ -575,6 +652,7 @@ function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunRes
         stdout: stripVTControlCharacters(Buffer.concat(stdout).toString("utf8")),
       });
     };
+
     // `error` is a command that could not start, such as a missing binary.
     child.on("error", (error) => finish(1, error.message));
     child.on("close", (code, signal) => finish(code ?? 1, signal ? `killed by ${signal}` : ""));
@@ -607,6 +685,7 @@ async function taskInfo(
     inFlight ? pipelineFor(meta) : null,
     inFlight ? linksFor(taskId, meta, title, recordedPr) : null,
   ]);
+
   return { crew, links, pipeline };
 }
 
@@ -614,6 +693,7 @@ async function taskInfo(
 function toDecision(decision: RawDecision, reason: string): Decision {
   const questions = parseQuestions(reason);
   const hasQuestions = questions.length > 0;
+
   return {
     id: decision.id,
     questions: questions.map((question, i) => ({ number: i + 1, ...question })),
@@ -628,6 +708,7 @@ function toDecision(decision: RawDecision, reason: string): Decision {
 /** Turn a landed artifact into a {@link LandedItem}. URLs are pull requests, paths are reports. */
 function toLandedItem(item: RawLanded): LandedItem {
   const isUrl = item.artifact.startsWith("http");
+
   return {
     id: item.id,
     kind: isUrl ? "pull_request" : "report",
@@ -651,6 +732,7 @@ function toTask(task: RawTask, info: TaskInfo | undefined): Task {
   const line = info?.crew || task.doing;
   const pipeline = info?.pipeline ?? null;
   const { sentence, state } = describeTask(line, pipeline, readyForReview(line));
+
   return {
     id: task.id,
     kind: task.kind === "ship" || task.kind === "scout" ? task.kind : "other",
@@ -684,7 +766,10 @@ let timer: ReturnType<typeof setTimeout> | undefined;
  * @returns The snapshot, or `null` before the first rebuild finishes.
  */
 export function getBearings(): Bearings | null {
-  if (!current) return null;
+  if (!current) {
+    return null;
+  }
+
   return {
     ...current,
     error: lastError,
@@ -703,7 +788,9 @@ export function getBearings(): Bearings | null {
  * previous snapshot and records the error. This never rejects.
  */
 async function refresh(): Promise<void> {
-  if (refreshing) return;
+  if (refreshing) {
+    return;
+  }
   refreshing = true;
   try {
     current = await build();
@@ -714,6 +801,7 @@ async function refresh(): Promise<void> {
   } finally {
     refreshing = false;
     clearTimeout(timer);
+
     const waitMs = (lastError ? RETRY_SECONDS : REFRESH_SECONDS) * 1000;
     nextMs = Date.now() + waitMs;
     timer = setTimeout(() => void refresh(), waitMs);
@@ -762,6 +850,7 @@ export async function sendAnswers(
   request: AnswerRequest,
 ): Promise<AnswerOutcome> {
   const decision = getBearings()?.waitingOnYou.decisions.find((d) => d.id === decisionId);
+
   if (!decision) {
     return {
       code: "decision_not_found",
@@ -773,10 +862,12 @@ export async function sendAnswers(
 
   const isFreeText = decision.questions.length === 0;
   const lines: string[] = [];
+
   for (const { answer, question: number } of request.answers) {
     const question = decision.questions.find((q) => q.number === number);
     // One line per answer, so an answer cannot add lines that look like part of the note.
     const oneLine = answer.replace(/\s+/g, " ");
+
     if (question) {
       lines.push(`${question.number}. ${question.title} → ${oneLine}`);
     } else if (isFreeText && number === 1) {
@@ -794,6 +885,7 @@ export async function sendAnswers(
   await sendNote(
     `Reply from the Fleet Bearings API to the open question "${decision.title}" (task ${decision.id}):\n${lines.join("\n")}`,
   );
+
   return { ok: true };
 }
 
@@ -816,6 +908,7 @@ async function sendNote(body: string): Promise<void> {
     input: body,
     timeoutMs: 30_000,
   });
+
   if (result.code !== 0) {
     throw new Error((result.stderr || result.stdout || "inbox failed").trim().slice(0, 200));
   }

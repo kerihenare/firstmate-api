@@ -572,12 +572,17 @@ for (const ops of Object.values(paths)) {
     const responses = op["responses"] as Record<string, Json>;
     responses["421"] = errorResponse("The Host header is not an allowed host name.");
     responses["500"] = errorResponse("An unexpected error. The server log has the details.");
-    if (op["security"] === undefined)
+    if (op["security"] === undefined) {
       responses["401"] = errorResponse(
         "An API key is set and the bearer token is missing or wrong.",
       );
-    if (method === "post") responses["403"] = errorResponse("The request came from another site.");
-    if (op["requestBody"]) responses["413"] = errorResponse("The body is over 20 KB.");
+    }
+    if (method === "post") {
+      responses["403"] = errorResponse("The request came from another site.");
+    }
+    if (op["requestBody"]) {
+      responses["413"] = errorResponse("The body is over 20 KB.");
+    }
   }
 }
 

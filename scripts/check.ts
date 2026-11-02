@@ -101,23 +101,34 @@ pass("OpenAPI 3.1 document is valid");
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 const addFormats = addFormatsImport as unknown as (a: Ajv2020) => void;
+
 addFormats(ajv);
 ajv.addSchema({ $id: "spec", components: openapi["components"] as { schemas: unknown } }, "spec");
 
 /** Call the running API, sending the API key unless told not to. */
 async function call(method: string, path: string, options: CallOptions = {}): Promise<CallResult> {
   const headers: Record<string, string> = {};
-  if (key && !options.noKey) headers["Authorization"] = `Bearer ${key}`;
-  if (options.type) headers["Content-Type"] = options.type;
-  if (options.origin) headers["Origin"] = options.origin;
+
+  if (key && !options.noKey) {
+    headers["Authorization"] = `Bearer ${key}`;
+  }
+  if (options.type) {
+    headers["Content-Type"] = options.type;
+  }
+  if (options.origin) {
+    headers["Origin"] = options.origin;
+  }
+
   const response = await fetch(base + path, { body: options.body, headers, method });
   const text = await response.text();
   let json: unknown = null;
+
   try {
     json = JSON.parse(text);
   } catch {
     // Not JSON; leave it null.
   }
+
   return { json, status: response.status };
 }
 
@@ -125,10 +136,12 @@ async function call(method: string, path: string, options: CallOptions = {}): Pr
 function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const probe = createServer();
+
     probe.on("error", reject);
     probe.listen(0, "127.0.0.1", () => {
       const address = probe.address();
       const port = typeof address === "object" && address ? address.port : 0;
+
       probe.close(() => resolve(port));
     });
   });
@@ -155,7 +168,9 @@ async function startFixtureServer(): Promise<string> {
     },
     stdio: ["ignore", "ignore", "inherit"],
   });
+
   process.on("exit", () => server.kill());
+
   return `http://127.0.0.1:${port}`;
 }
 
@@ -168,9 +183,16 @@ async function startFixtureServer(): Promise<string> {
  * @param validate - Checks the body against a schema (see {@link validator}).
  */
 function expect(label: string, got: CallResult, status: number, validate?: Validator): void {
-  if (got.status !== status) return fail(`${label}: expected ${status}, got ${got.status}`);
+  if (got.status !== status) {
+    return fail(`${label}: expected ${status}, got ${got.status}`);
+  }
+
   const problem = validate ? validate(got.json) : null;
-  if (problem) return fail(`${label}: ${problem}`);
+
+  if (problem) {
+    return fail(`${label}: ${problem}`);
+  }
+
   pass(`${label} -> ${status}`);
 }
 
@@ -183,13 +205,21 @@ function expect(label: string, got: CallResult, status: number, validate?: Valid
  */
 function validator(name: string, array = false): Validator {
   const validate = ajv.getSchema(`spec#/components/schemas/${name}`);
-  if (!validate) throw new Error(`no schema ${name}`);
+
+  if (!validate) {
+    throw new Error(`no schema ${name}`);
+  }
+
   return (value) => {
     // [null] makes a non-array fail with a readable error.
     const items = array ? (Array.isArray(value) ? value : [null]) : [value];
+
     for (const item of items) {
-      if (!validate(item)) return ajv.errorsText(validate.errors, { separator: "; " });
+      if (!validate(item)) {
+        return ajv.errorsText(validate.errors, { separator: "; " });
+      }
     }
+
     return null;
   };
 }
@@ -203,6 +233,7 @@ function validator(name: string, array = false): Validator {
  */
 function checkFixtureValues(bearings: Bearings): void {
   const ship = bearings.underway.find((task) => task.id === "ship-1");
+
   expectEqual(
     "fixture: tasks under way",
     bearings.underway.map((task) => [task.id, task.kind, task.state]),
@@ -262,14 +293,18 @@ const sampleDecision = {
   title: "Sample",
 };
 const decisionProblem = validator("Decision")(sampleDecision);
+
 if (
   questions.length !== 3 ||
   questions[0]?.options.filter((o) => o.recommended).length !== 1 ||
   questions[2]?.options.length !== 4
-)
+) {
   fail("parseQuestions sample");
-else if (decisionProblem) fail(`sample Decision: ${decisionProblem}`);
-else pass("parseQuestions output matches the Decision schema");
+} else if (decisionProblem) {
+  fail(`sample Decision: ${decisionProblem}`);
+} else {
+  pass("parseQuestions output matches the Decision schema");
+}
 
 const sampleRun = [
   "run:",
@@ -288,16 +323,23 @@ const sampleRun = [
 ].join("\n");
 const pipeline = parsePipeline(sampleRun);
 const pipeProblem = pipeline ? validator("Pipeline")(pipeline) : "no pipeline parsed";
-if (pipeProblem || pipeline?.findings.length !== 2)
+
+if (pipeProblem || pipeline?.findings.length !== 2) {
   fail(`parsePipeline sample: ${pipeProblem ?? "wrong finding count"}`);
-else pass("parsePipeline output matches the Pipeline schema");
+} else {
+  pass("parsePipeline output matches the Pipeline schema");
+}
+
 const described = describeTask("state: parked · source: run-step", pipeline, false);
+
 if (
   described.sentence !== "Paused at the tests with 2 findings waiting for a decision." ||
   described.state !== "waiting"
-)
+) {
   fail(`describeTask sample: ${described.sentence}`);
-else pass("describeTask writes a plain sentence for a held run");
+} else {
+  pass("describeTask writes a plain sentence for a held run");
+}
 
 expectEqual("splitRow keeps quoted commas and escapes", splitRow('a,"b, c","say \\"hi\\"",'), [
   "a",
@@ -305,6 +347,7 @@ expectEqual("splitRow keeps quoted commas and escapes", splitRow('a,"b, c","say 
   'say "hi"',
   "",
 ]);
+
 const shuffled = parsePipeline(
   [
     "run:",
@@ -316,13 +359,19 @@ const shuffled = parsePipeline(
     "    running,test,1,,2",
   ].join("\n"),
 );
+
 expectEqual("parsePipeline reads columns by header and keeps unknown statuses", shuffled?.steps, [
   { findings: 0, name: "intent", status: "completed" },
   { findings: 0, name: "review", status: "unknown" },
   { findings: 1, name: "test", status: "running" },
 ]);
+
 const shuffledProblem = shuffled ? validator("Pipeline")(shuffled) : "no pipeline parsed";
-if (shuffledProblem) fail(`parsePipeline unknown status: ${shuffledProblem}`);
+
+if (shuffledProblem) {
+  fail(`parsePipeline unknown status: ${shuffledProblem}`);
+}
+
 expectEqual(
   "slugFromRemote keeps dots in repo names",
   [
@@ -347,6 +396,7 @@ expectEqual(
   describeTask("state: queued · source: gate", null, false).state,
   "waiting",
 );
+
 const doneRun = parsePipeline(
   [
     "run:",
@@ -357,6 +407,7 @@ const doneRun = parsePipeline(
     "    ci,skipped",
   ].join("\n"),
 );
+
 expectEqual("describeTask calls a fully done run finished", describeTask("", doneRun, false), {
   sentence: "All validation steps are done.",
   state: "finished",
@@ -366,6 +417,7 @@ expectEqual("describeTask calls a fully done run finished", describeTask("", don
 const snapshotError = (text: string): string => {
   try {
     parseSnapshot(text);
+
     return "";
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
@@ -379,6 +431,7 @@ const goodSnapshot = {
   landed: [],
   recorded_prs: [],
 };
+
 expectEqual(
   "parseSnapshot accepts a good snapshot and names what is wrong with bad ones",
   [
@@ -403,12 +456,14 @@ expectEqual(
 const settingsError = (env: Record<string, string>): string => {
   try {
     parseSettings(env);
+
     return "";
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
   }
 };
 const defaults = parseSettings({ BEARINGS_API_PORT: " ", FM_HOME: "/tmp/fm" });
+
 expectEqual(
   "parseSettings fills in defaults and treats blank variables as unset",
   [defaults.port, defaults.refreshSeconds, defaults.allowedHosts, defaults.fmHome, defaults.ghBin],
@@ -466,9 +521,13 @@ if (offline) {
 }
 
 // ---------- live API: wait for the first snapshot ----------
-if (fixture) base = await startFixtureServer();
+if (fixture) {
+  base = await startFixtureServer();
+}
+
 let ready = false;
 const readyDeadline = Date.now() + READY_TIMEOUT_MS;
+
 while (!ready && Date.now() < readyDeadline) {
   try {
     const health = await call("GET", "/health");
@@ -476,7 +535,9 @@ while (!ready && Date.now() < readyDeadline) {
   } catch {
     // Not listening yet.
   }
-  if (!ready) await new Promise((resolve) => setTimeout(resolve, 3000));
+  if (!ready) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
 }
 if (!ready) {
   fail("API never became ready");
@@ -484,9 +545,14 @@ if (!ready) {
 }
 
 const bearings = await call("GET", "/api/v1/bearings");
+
 expect("GET /api/v1/bearings", bearings, 200, validator("Bearings"));
 expect("GET /health", await call("GET", "/health"), 200, validator("Health"));
-if (fixture) checkFixtureValues(bearings.json as Bearings);
+
+if (fixture) {
+  checkFixtureValues(bearings.json as Bearings);
+}
+
 expect("GET /api/v1/tasks", await call("GET", "/api/v1/tasks"), 200, validator("Task", true));
 expect(
   "GET /api/v1/tasks?state=working",
@@ -506,14 +572,18 @@ expect(
   400,
   validator("Error"),
 );
-if (key)
+
+if (key) {
   expect(
     "GET /api/v1/bearings without the key",
     await call("GET", "/api/v1/bearings", { noKey: true }),
     401,
     validator("Error"),
   );
-else console.log("  skip BEARINGS_API_KEY not set, so the 401 case was not exercised");
+} else {
+  console.log("  skip BEARINGS_API_KEY not set, so the 401 case was not exercised");
+}
+
 expect(
   "GET /api/v1/activity?limit=3",
   await call("GET", "/api/v1/activity?limit=3"),
@@ -537,13 +607,15 @@ expect("GET unknown path", await call("GET", "/api/v1/nothing"), 404, validator(
 expect("HEAD /api/v1/bearings", await call("HEAD", "/api/v1/bearings"), 200);
 
 const first = (bearings.json as { underway: { id: string }[] }).underway[0];
-if (first)
+
+if (first) {
   expect(
     `GET /api/v1/tasks/${first.id}`,
     await call("GET", `/api/v1/tasks/${first.id}`),
     200,
     validator("Task"),
   );
+}
 
 // ---------- request validation, without creating any note ----------
 expect(
@@ -615,10 +687,12 @@ expect(
   202,
   validator("RefreshReceipt"),
 );
+
 // Question 999 never exists (a free-text decision only takes question 1), so no note is sent.
 const decision = (bearings.json as { waitingOnYou: { decisions: { id: string }[] } }).waitingOnYou
   .decisions[0];
-if (decision)
+
+if (decision) {
   expect(
     "POST answers unknown question number",
     await call("POST", `/api/v1/questions/${decision.id}/answers`, {
@@ -628,12 +702,17 @@ if (decision)
     422,
     validator("Error"),
   );
-else console.log("  skip no open decision, so the 422 case was not exercised");
+} else {
+  console.log("  skip no open decision, so the 422 case was not exercised");
+}
 
 const spec = await call("GET", "/openapi.json");
-if (spec.status === 200 && (spec.json as { openapi?: string } | null)?.openapi === "3.1.0")
+
+if (spec.status === 200 && (spec.json as { openapi?: string } | null)?.openapi === "3.1.0") {
   pass("GET /openapi.json serves the spec");
-else fail("GET /openapi.json");
+} else {
+  fail("GET /openapi.json");
+}
 
 console.log(failures === 0 ? "\nAll checks passed." : `\n${failures} check(s) failed.`);
 process.exit(failures === 0 ? 0 : 1);

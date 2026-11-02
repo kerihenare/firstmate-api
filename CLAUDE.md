@@ -41,6 +41,12 @@ The API never acts on Firstmate directly. The only writes are `POST /questions/{
 
 `tsconfig` sets `erasableSyntaxOnly`, `verbatimModuleSyntax`, `allowImportingTsExtensions` and `noUncheckedIndexedAccess`. So: no enums, namespaces or parameter properties; use `import type` for types; local imports end in `.ts`; indexed access is `T | undefined`, and env vars are read only in `env.ts`.
 
+## Code layout
+
+- Always use curly braces for control flow (oxlint `curly: all` enforces this).
+- Put an empty line before a `return`, unless it is the first statement in its block.
+- Put an empty line between statements of different kinds: control blocks (`if`, `for`, `while`, `switch`, `try`, …, separated from their neighbours outside the braces), function calls, and variable declarations. Consecutive statements of the same kind need no blank line. oxlint has no rule for these two, so keep to them by hand.
+
 ## Doc comments
 
 Use TSDoc (`/** … */`), not plain JSDoc. Every module opens with a `@packageDocumentation` comment. Every function, type, interface field and module-level constant gets a doc comment unless its name already says everything. Tags: `@param name - description` (with the hyphen, no `{type}`), `@returns`, `@remarks` for detail beyond the one-line summary, `@example` with a fenced block, `@throws`, `@typeParam`, `@defaultValue`, and `{@link Name}`. oxlint's `jsdoc` plugin rejects unknown tags and `@param`/`@returns` tags with no description.
