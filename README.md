@@ -2,14 +2,15 @@
 
 A JSON API over the Fleet Bearings view of a [Firstmate](https://github.com/kunchenguid/firstmate) home: the questions waiting on the captain, the work under way with its validation steps, what landed, what is queued, and recent activity. It is described by an OpenAPI 3.1 spec that the server itself serves.
 
-TypeScript, no runtime dependencies. Node 26 runs the `.ts` files directly. Uses pnpm (pinned in `packageManager`).
+TypeScript with one runtime dependency, [Zod](https://zod.dev), which checks every input: settings, request bodies, query and path parameters, and what Firstmate prints. Node 26 runs the `.ts` files directly. Uses pnpm (pinned in `packageManager`).
 
 ## Run it
 
 It reads a Firstmate home, so run it on the machine that has one.
 
 ```sh
-pnpm install       # dev tools only: the TypeScript compiler, oxlint, oxfmt and the spec validators
+pnpm install       # Zod, plus the dev tools: the TypeScript compiler, oxlint, oxfmt and the spec validators
+cp .env.example .env.local   # optional: settings (see below)
 pnpm start         # http://localhost:4748
 ```
 
@@ -48,8 +49,13 @@ Writes (`POST`) that carry an `Origin` header from another site get a 403, so a 
 | `BEARINGS_API_REFRESH`       | `300`                       | Seconds between rebuilds, from 10 to 86400                                                                           |
 | `BEARINGS_LINEAR_BASE`       | none                        | Ticket link base, for example `https://linear.app/<workspace>/issue/`                                                |
 | `BEARINGS_LINEAR_TEAMS`      | none                        | Linear team keys to recognise, for example `LIV,ENG`. Tasks get a ticket link only when both Linear settings are set |
+| `BEARINGS_GH_BIN`            | `gh`                        | The GitHub CLI command (a name on `PATH` or an absolute path)                                                        |
+| `BEARINGS_GIT_BIN`           | `git`                       | The git command                                                                                                      |
+| `BEARINGS_NO_MISTAKES_BIN`   | `no-mistakes`               | The no-mistakes command                                                                                              |
 
-`start.sh` also reads an optional `.env.local` (not committed).
+`.env.example` lists them all. Copy it to `.env.local` (not committed): `pnpm start` and `start.sh` both read it, and variables already set in the environment win. Blank values count as unset. A bad value (a port that is not a number, a Linear base that is not an http(s) URL, a team key with symbols) stops the server at startup with a message naming each bad variable.
+
+`start.sh` also takes `BEARINGS_API_NODE` (the node binary), `BEARINGS_API_PID_FILE` and `BEARINGS_API_LOG_FILE` (default `server.pid` and `server.log` in the repo).
 
 ## Checks
 
@@ -64,6 +70,6 @@ pnpm check --fixture  # starts its own server on the fixed Firstmate home in fix
                       # runs every check, plus the exact values that home should give (CI runs this)
 ```
 
-`fixtures/home` has stub `bin/` scripts (and a `no-mistakes` stub) that print fixed output. When you change what the API reads from Firstmate, update the stubs and the `fixture:` checks in `scripts/check.ts` to match.
+`fixtures/home` has stub `bin/` scripts (and a `no-mistakes` stub, used via `BEARINGS_NO_MISTAKES_BIN`) that print fixed output. When you change what the API reads from Firstmate, update the stubs and the `fixture:` checks in `scripts/check.ts` to match.
 
 The spec is in `src/openapi.ts` and mirrors the types in `src/types.ts`.

@@ -16,7 +16,7 @@ import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { integerSetting } from "./env.ts";
+import { settings } from "./env.ts";
 import {
   getBearings,
   refreshInBackground,
@@ -26,35 +26,29 @@ import {
 } from "./gather.ts";
 import type { AnswerOutcome } from "./gather.ts";
 import { openapi } from "./openapi.ts";
-import { isRecord } from "./status.ts";
+import {
+  ActivityLimitSchema,
+  AnswerRequestSchema,
+  IdSchema,
+  NoteRequestSchema,
+  TaskStateFilterSchema,
+} from "./schemas.ts";
 import { ACTIVITY_LIMIT, TASK_STATES } from "./types.ts";
-import type {
-  AnswerRequest,
-  ApiError,
-  Bearings,
-  NoteReceipt,
-  NoteRequest,
-  RefreshReceipt,
-} from "./types.ts";
+import type { ApiError, Bearings, NoteReceipt, RefreshReceipt } from "./types.ts";
 
 // ---------- settings ----------
 
 /** Host names this server answers to. Requests for any other Host get 421. */
-const ALLOWED_HOSTS = new Set(
-  (process.env["BEARINGS_API_ALLOWED_HOSTS"] ?? "localhost,127.0.0.1,[::1]")
-    .split(",")
-    .map((host) => host.trim().toLowerCase())
-    .filter(Boolean),
-);
+const ALLOWED_HOSTS = new Set(settings.allowedHosts);
 
-/** `/api/v1/questions/{id}/answers`. The id is captured. */
-const ANSWERS_ROUTE = /^\/api\/v1\/questions\/([A-Za-z0-9._-]+)\/answers$/;
+/** `/api/v1/questions/{id}/answers`. The id is captured and checked with {@link IdSchema}. */
+const ANSWERS_ROUTE = /^\/api\/v1\/questions\/([^/]+)\/answers$/;
 
 /** The bearer token every `/api/v1/*` request must send, or `""` to leave the API open. */
-const API_KEY = process.env["BEARINGS_API_KEY"] ?? "";
+const API_KEY = settings.apiKey;
 
-/** `/api/v1/questions/{id}`. The id is captured. */
-const DECISION_ROUTE = /^\/api\/v1\/questions\/([A-Za-z0-9._-]+)$/;
+/** `/api/v1/questions/{id}`. The id is captured and checked with {@link IdSchema}. */
+const DECISION_ROUTE = /^\/api\/v1\/questions\/([^/]+)$/;
 
 // SWAGGER comes before DOCS because DOCS is built from it.
 /** Where the Swagger UI assets for `/docs` are loaded from, pinned with subresource integrity. */
@@ -69,18 +63,16 @@ const DOCS = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta c
 <script>window.onload=function(){SwaggerUIBundle({deepLinking:true,dom_id:"#ui",url:"/openapi.json"})}</script></body></html>`;
 
 /** The interface to listen on. Loopback only by default. */
-const HOST = process.env["BEARINGS_API_HOST"] ?? "127.0.0.1";
+const HOST = settings.host;
 
 /** The largest request body accepted, in bytes. Larger bodies get 413. */
 const MAX_BODY_BYTES = 20_000;
 
 /** The port to listen on. */
-const PORT = integerSetting("BEARINGS_API_PORT", 4748, 1, 65_535);
+const PORT = settings.port;
 
-/** `/api/v1/tasks/{id}`. The id is captured. */
-const TASK_ROUTE = /^\/api\/v1\/tasks\/([A-Za-z0-9._-]+)$/;
-
-const TASK_STATE_SET = new Set<string>(TASK_STATES);
+/** `/api/v1/tasks/{id}`. The id is captured and checked with {@link IdSchema}. */
+const TASK_ROUTE = /^\/api\/v1\/tasks\/([^/]+)$/;
 
 // ---------- types ----------
 
@@ -97,53 +89,24 @@ type JsonBody =
       status: number;
     };
 
-// ---------- request validation ----------
+// ---------- request parsing ----------
 
 /**
- * Check that a parsed body is a valid {@link AnswerRequest}.
+ * The id a route captures, when the route matches and the id is valid.
  *
- * @remarks
- * Unknown keys are refused at both levels. There must be 1 to 20 answers, each with a whole
- * question number of at least 1 and a non-blank answer of at most 2000 characters. Each
- * question may be answered only once.
- *
- * @returns The request with each answer trimmed, or `null` when the body is the wrong shape.
+ * @param pattern - A route with one capture group for the id.
+ * @param route - The request path, without a trailing slash.
+ * @returns The id, or `undefined` when the route does not match or the id is not valid (see
+ *   {@link IdSchema}), in which case the request falls through to 404.
  */
-function asAnswerRequest(value: unknown): AnswerRequest | null {
-  if (!isRecord(value) || !hasOnlyKeys(value, ["answers"])) return null;
-  const list = value["answers"];
-  if (!Array.isArray(list) || list.length < 1 || list.length > 20) return null;
-
-  const answers: AnswerRequest["answers"] = [];
-  const seen = new Set<number>();
-  for (const item of list as unknown[]) {
-    if (!isRecord(item) || !hasOnlyKeys(item, ["answer", "question"])) return null;
-    const { answer, question } = item;
-    if (typeof question !== "number" || !Number.isInteger(question) || question < 1) return null;
-    if (typeof answer !== "string" || answer.trim().length < 1 || answer.length > 2000) return null;
-    if (seen.has(question)) return null;
-    seen.add(question);
-    answers.push({ answer: answer.trim(), question });
-  }
-  return { answers };
+function routeId(pattern: RegExp, route: string): string | undefined {
+  const parsed = IdSchema.safeParse(pattern.exec(route)?.[1]);
+  return parsed.success ? parsed.data : undefined;
 }
 
-/**
- * Check that a parsed body is a valid {@link NoteRequest}: only a `text` key, holding a
- * non-blank string of at most 4000 characters.
- *
- * @returns The request with its text trimmed, or `null` when the body is the wrong shape.
- */
-function asNoteRequest(value: unknown): NoteRequest | null {
-  if (!isRecord(value) || !hasOnlyKeys(value, ["text"])) return null;
-  const { text } = value;
-  if (typeof text !== "string" || text.trim().length < 1 || text.length > 4000) return null;
-  return { text: text.trim() };
-}
-
-/** Whether every key of `record` is one of `allowed`. Missing keys are fine. */
-function hasOnlyKeys(record: Record<string, unknown>, allowed: string[]): boolean {
-  return Object.keys(record).every((key) => allowed.includes(key));
+/** A query parameter, or `undefined` when it is absent, ready for a Zod schema. */
+function query(url: URL, name: string): string | undefined {
+  return url.searchParams.get(name) ?? undefined;
 }
 
 /**
@@ -332,10 +295,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
 
     if (route === "/api/v1/tasks") {
-      const state = url.searchParams.get("state");
-      if (state !== null && !TASK_STATE_SET.has(state)) {
+      const parsed = TaskStateFilterSchema.safeParse(query(url, "state"));
+      if (!parsed.success) {
         return fail(res, 400, "invalid_state", `state must be one of: ${TASK_STATES.join(", ")}.`);
       }
+      const state = parsed.data;
       const bearings = needBearings(res);
       if (!bearings) return;
       const tasks = state
@@ -344,7 +308,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return send(res, 200, tasks);
     }
 
-    const taskId = TASK_ROUTE.exec(route)?.[1];
+    const taskId = routeId(TASK_ROUTE, route);
     if (taskId) {
       const bearings = needBearings(res);
       if (!bearings) return;
@@ -358,7 +322,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return bearings ? send(res, 200, bearings.waitingOnYou) : undefined;
     }
 
-    const decisionId = DECISION_ROUTE.exec(route)?.[1];
+    const decisionId = routeId(DECISION_ROUTE, route);
     if (decisionId) {
       const bearings = needBearings(res);
       if (!bearings) return;
@@ -370,9 +334,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
 
     if (route === "/api/v1/activity") {
-      const rawLimit = url.searchParams.get("limit");
-      const limit = rawLimit === null ? ACTIVITY_LIMIT : Number(rawLimit);
-      if (!Number.isInteger(limit) || limit < 1 || limit > ACTIVITY_LIMIT) {
+      const limit = ActivityLimitSchema.safeParse(query(url, "limit"));
+      if (!limit.success) {
         return fail(
           res,
           400,
@@ -382,33 +345,33 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       }
       const bearings = needBearings(res);
       if (!bearings) return;
-      return send(res, 200, bearings.activity.slice(0, limit));
+      return send(res, 200, bearings.activity.slice(0, limit.data));
     }
   }
 
   if (method === "POST") {
-    const answersFor = ANSWERS_ROUTE.exec(route)?.[1];
+    const answersFor = routeId(ANSWERS_ROUTE, route);
     if (answersFor) {
       // Answers are checked against the open decisions, so there must be a snapshot.
       if (!needBearings(res)) return;
       const body = await readJson(req);
       if (!body.ok) return fail(res, body.status, body.code, body.message);
-      const request = asAnswerRequest(body.value);
-      if (!request) {
+      const request = AnswerRequestSchema.safeParse(body.value);
+      if (!request.success) {
         const expected =
           'Expected {"answers":[{"question":1,"answer":"..."}]}, with each question answered once.';
         return fail(res, 400, "invalid_body", expected);
       }
-      return deliver(res, () => sendAnswers(answersFor, request));
+      return deliver(res, () => sendAnswers(answersFor, request.data));
     }
 
     if (route === "/api/v1/notes") {
       const body = await readJson(req);
       if (!body.ok) return fail(res, body.status, body.code, body.message);
-      const request = asNoteRequest(body.value);
-      if (!request) return fail(res, 400, "invalid_body", 'Expected {"text":"..."}.');
+      const request = NoteRequestSchema.safeParse(body.value);
+      if (!request.success) return fail(res, 400, "invalid_body", 'Expected {"text":"..."}.');
       return deliver(res, async () => {
-        await sendGeneralNote(request.text);
+        await sendGeneralNote(request.data.text);
         return { ok: true };
       });
     }

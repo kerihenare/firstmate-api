@@ -14,10 +14,11 @@ import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 
-import { integerSetting } from "./env.ts";
+import { settings } from "./env.ts";
+import { TaskMetaSchema } from "./schemas.ts";
+import type { TaskMeta } from "./schemas.ts";
 import {
   describeTask,
   firstSentence,
@@ -50,15 +51,12 @@ import type {
 
 // ---------- settings ----------
 
-// HERE comes first because FM_HOME is built from it.
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-
 /**
  * The Firstmate home directory.
  *
  * @defaultValue Two levels above this repo, which assumes the repo sits inside a Firstmate home.
  */
-export const FM_HOME = process.env["FM_HOME"] ?? path.resolve(HERE, "..", "..", "..");
+export const FM_HOME = settings.fmHome;
 
 /** Status files untouched for longer than this are left out of the activity feed. */
 const ACTIVITY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -74,23 +72,27 @@ const EVENT_KIND: Record<string, ActivityEvent["kind"]> = {
   resolved: "decision_made",
 };
 
+/** The command that runs the GitHub CLI. */
+const GH = settings.ghBin;
+
+/** The command that runs git. */
+const GIT = settings.gitBin;
+
 /** How long a stopped command's process group gets to exit after SIGTERM, before SIGKILL. */
 const KILL_GRACE_MS = 5000;
 
 /** The base URL for ticket links, for example `https://linear.app/<workspace>/issue/`. */
-const LINEAR_BASE = process.env["BEARINGS_LINEAR_BASE"] ?? "";
+const LINEAR_BASE = settings.linearBase;
 
 /**
- * The Linear team keys to recognise, for example `LIV,ENG`.
+ * The Linear team keys to recognise, for example `["LIV", "ENG"]`.
  *
  * @remarks
- * Tasks get a ticket link only when this and {@link LINEAR_BASE} are both set. Keys that are
- * not plain letters and digits are ignored, which keeps them safe to use in a regular expression.
+ * Tasks get a ticket link only when this and {@link LINEAR_BASE} are both set. The settings
+ * check refuses keys that are not plain letters and digits, which keeps them safe to use in a
+ * regular expression.
  */
-const LINEAR_TEAMS = (process.env["BEARINGS_LINEAR_TEAMS"] ?? "")
-  .split(",")
-  .map((team) => team.trim().toUpperCase())
-  .filter((team) => /^[A-Z0-9]+$/.test(team));
+const LINEAR_TEAMS = settings.linearTeams;
 
 /**
  * The most output a command may print, in bytes, across stdout and stderr. Past this it is
@@ -98,14 +100,17 @@ const LINEAR_TEAMS = (process.env["BEARINGS_LINEAR_TEAMS"] ?? "")
  */
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 
+/** The command that runs no-mistakes. */
+const NO_MISTAKES = settings.noMistakesBin;
+
 /**
  * Seconds between scheduled rebuilds.
  *
  * @remarks
  * At least 10, since every rebuild runs dozens of processes. A bad value stops the server at
- * startup (see {@link integerSetting}).
+ * startup (see `env.ts`).
  */
-export const REFRESH_SECONDS = integerSetting("BEARINGS_API_REFRESH", 300, 10, 86_400);
+export const REFRESH_SECONDS = settings.refreshSeconds;
 
 /** After a failed rebuild, retry this soon rather than waiting a full interval. */
 const RETRY_SECONDS = Math.min(30, REFRESH_SECONDS);
@@ -375,13 +380,12 @@ function killGroup(child: ChildProcess): void {
  */
 async function linksFor(
   taskId: string,
-  meta: Record<string, string>,
+  meta: TaskMeta,
   title: string,
   recordedPr: string,
 ): Promise<TaskLinks> {
-  let prUrl = recordedPr || meta["pr"] || "";
-  const branch = meta["branch"];
-  const project = meta["project"];
+  let prUrl = recordedPr || meta.pr || "";
+  const { branch, project } = meta;
   if (!prUrl && branch && project) prUrl = await openPrForBranch(project, branch);
 
   let key = "";
@@ -435,7 +439,7 @@ async function openPrForBranch(projectDir: string, branch: string): Promise<stri
   const slug = await repoSlug(projectDir);
   if (!slug) return "";
   const args = ["pr", "list", "-R", slug, "--head", branch, "--state", "open"];
-  const result = await run("gh", [...args, "--json", "url", "--jq", ".[0].url"], {
+  const result = await run(GH, [...args, "--json", "url", "--jq", ".[0].url"], {
     timeoutMs: 25_000,
   });
   const url = result.stdout.trim();
@@ -448,15 +452,15 @@ async function openPrForBranch(projectDir: string, branch: string): Promise<stri
  * @returns The run, or `null` when the task does not use no-mistakes, its worktree is gone, or
  *   the status output cannot be parsed.
  */
-async function pipelineFor(meta: Record<string, string>): Promise<Pipeline | null> {
-  const worktree = meta["worktree"];
-  if (meta["mode"] !== "no-mistakes" || !worktree) return null;
+async function pipelineFor(meta: TaskMeta): Promise<Pipeline | null> {
+  const { worktree } = meta;
+  if (meta.mode !== "no-mistakes" || !worktree) return null;
   try {
     await stat(worktree);
   } catch {
     return null;
   }
-  const result = await run("no-mistakes", ["axi", "status"], { cwd: worktree, timeoutMs: 40_000 });
+  const result = await run(NO_MISTAKES, ["axi", "status"], { cwd: worktree, timeoutMs: 40_000 });
   return result.stdout ? parsePipeline(result.stdout) : null;
 }
 
@@ -467,23 +471,24 @@ function prNumber(url: string): number | null {
 }
 
 /**
- * Read `state/<id>.meta`, a file of `key=value` lines.
+ * Read `state/<id>.meta`, a file of `key=value` lines, and keep the keys this API reads.
  *
- * @returns The keys and values, or an empty object when the task has no meta file.
+ * @returns The keys and values (see {@link TaskMetaSchema}), or an empty object when the task
+ *   has no meta file.
  */
-async function readMeta(taskId: string): Promise<Record<string, string>> {
-  const meta: Record<string, string> = {};
+async function readMeta(taskId: string): Promise<TaskMeta> {
+  const pairs: Record<string, string> = {};
   let text: string;
   try {
     text = await readFile(path.join(FM_HOME, "state", `${taskId}.meta`), "utf8");
   } catch {
-    return meta;
+    return {};
   }
   for (const line of text.split("\n")) {
     const equals = line.indexOf("=");
-    if (equals > 0) meta[line.slice(0, equals)] = line.slice(equals + 1);
+    if (equals > 0) pairs[line.slice(0, equals)] = line.slice(equals + 1);
   }
-  return meta;
+  return TaskMetaSchema.parse(pairs);
 }
 
 /**
@@ -504,7 +509,7 @@ async function readSnapshot(): Promise<RawSnapshot> {
 async function repoSlug(projectDir: string): Promise<string> {
   const cached = repoSlugCache.get(projectDir);
   if (cached !== undefined) return cached;
-  const result = await run("git", ["-C", projectDir, "remote", "get-url", "origin"], {
+  const result = await run(GIT, ["-C", projectDir, "remote", "get-url", "origin"], {
     timeoutMs: 10_000,
   });
   const slug = slugFromRemote(result.stdout);

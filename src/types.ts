@@ -8,6 +8,9 @@
  * The enums are `as const` arrays defined once here. `openapi.ts` and `status.ts` read the same
  * arrays, so the spec, the parsers and the types can never disagree on the allowed values.
  *
+ * The request and `Raw*` types are also checked at runtime by the Zod schemas in `schemas.ts`,
+ * which are tied to these types with `satisfies`.
+ *
  * @packageDocumentation
  */
 
@@ -294,7 +297,6 @@ export interface RawTask {
   kind: string;
   name: string;
   repo: string;
-  state: string;
 }
 
 /** A pull request whose checks are green and which is waiting for the captain to merge. */

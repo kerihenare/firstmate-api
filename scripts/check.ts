@@ -9,7 +9,7 @@
  * `--offline` stops after the spec and parser checks, so it needs no server or Firstmate home.
  *
  * `--fixture` starts its own server on a free port, reading the fixed Firstmate home in
- * `fixtures/home` (stub scripts, plus a `no-mistakes` stub put on its `PATH`), with an API key
+ * `fixtures/home` (stub scripts, plus a `no-mistakes` stub named by `BEARINGS_NO_MISTAKES_BIN`), with an API key
  * and Linear settings. It then runs every check, plus checks of the exact values that home
  * should produce. This is what CI runs.
  *
@@ -27,7 +27,9 @@ import SwaggerParser from "@apidevtools/swagger-parser";
 import addFormatsImport from "ajv-formats";
 import { Ajv2020 } from "ajv/dist/2020.js";
 
+import { parseSettings } from "../src/env.ts";
 import { openapi } from "../src/openapi.ts";
+import { ActivityLimitSchema, AnswerRequestSchema, NoteRequestSchema } from "../src/schemas.ts";
 import {
   describeTask,
   parsePipeline,
@@ -148,9 +150,8 @@ async function startFixtureServer(): Promise<string> {
       BEARINGS_API_PORT: String(port),
       BEARINGS_LINEAR_BASE: "https://linear.example/issue/",
       BEARINGS_LINEAR_TEAMS: "LIV",
+      BEARINGS_NO_MISTAKES_BIN: path.join(home, "bin", "no-mistakes"),
       FM_HOME: home,
-      // The fixture's `no-mistakes` stub comes first.
-      PATH: `${path.join(home, "bin")}${path.delimiter}${process.env["PATH"] ?? ""}`,
     },
     stdio: ["ignore", "ignore", "inherit"],
   });
@@ -396,6 +397,67 @@ expectEqual(
     'The snapshot\'s gates[0] has a "reason" that is not text.',
     'The snapshot\'s "contributions" needs checked, complete and known.',
   ],
+);
+
+/** The error `parseSettings` throws for some variables, or `""` when it accepts them. */
+const settingsError = (env: Record<string, string>): string => {
+  try {
+    parseSettings(env);
+    return "";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+};
+const defaults = parseSettings({ BEARINGS_API_PORT: " ", FM_HOME: "/tmp/fm" });
+expectEqual(
+  "parseSettings fills in defaults and treats blank variables as unset",
+  [defaults.port, defaults.refreshSeconds, defaults.allowedHosts, defaults.fmHome, defaults.ghBin],
+  [4748, 300, ["localhost", "127.0.0.1", "[::1]"], "/tmp/fm", "gh"],
+);
+expectEqual(
+  "parseSettings reads lists and names every bad variable",
+  [
+    parseSettings({ BEARINGS_API_ALLOWED_HOSTS: "A.local, ,b", BEARINGS_LINEAR_TEAMS: "liv,ENG" })
+      .allowedHosts,
+    parseSettings({ BEARINGS_LINEAR_TEAMS: "liv, ENG" }).linearTeams,
+    settingsError({ BEARINGS_API_PORT: "80x", BEARINGS_API_REFRESH: "5" }),
+    settingsError({ BEARINGS_LINEAR_BASE: "javascript:alert(1)", BEARINGS_LINEAR_TEAMS: "L(V" }),
+  ],
+  [
+    ["a.local", "b"],
+    ["LIV", "ENG"],
+    "Bad settings: BEARINGS_API_PORT must be a whole number from 1 to 65535; BEARINGS_API_REFRESH must be a whole number from 10 to 86400.",
+    "Bad settings: BEARINGS_LINEAR_BASE must be an http or https URL; BEARINGS_LINEAR_TEAMS.0 must be letters and digits.",
+  ],
+);
+
+expectEqual(
+  "request schemas trim and refuse bad bodies",
+  [
+    AnswerRequestSchema.safeParse({ answers: [{ answer: " yes ", question: 1 }] }).data,
+    AnswerRequestSchema.safeParse({ answers: [{ answer: "x", extra: 1, question: 1 }] }).success,
+    AnswerRequestSchema.safeParse({ answers: [{ answer: "x", question: 1.5 }] }).success,
+    AnswerRequestSchema.safeParse({ answers: [] }).success,
+    NoteRequestSchema.safeParse({ text: "  hi " }).data,
+    NoteRequestSchema.safeParse({ text: "   " }).success,
+    NoteRequestSchema.safeParse({ text: "x".repeat(4001) }).success,
+  ],
+  [
+    { answers: [{ answer: "yes", question: 1 }] },
+    false,
+    false,
+    false,
+    { text: "hi" },
+    false,
+    false,
+  ],
+);
+expectEqual(
+  "ActivityLimitSchema defaults, coerces and bounds the limit",
+  [undefined, "3", "0", "17", "2.5", "abc"].map(
+    (limit) => ActivityLimitSchema.safeParse(limit).data ?? null,
+  ),
+  [16, 3, null, null, null, null],
 );
 
 if (offline) {
