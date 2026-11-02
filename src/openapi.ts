@@ -2,15 +2,41 @@
  * The OpenAPI 3.1 description of the Fleet Bearings API, served at `/openapi.json`.
  *
  * @remarks
- * The schemas here are written by hand to mirror `types.ts`. Any change to a response type or
- * an endpoint must be made in both files; `pnpm check` validates real responses against these
- * schemas and catches drift.
+ * The component schemas are generated from the Zod schemas in `types.ts` and `schemas.ts`, so
+ * they always match the types. The operations (paths, parameters and responses) are written by
+ * hand here; `pnpm check` calls every one and validates the responses against the spec.
  *
  * @packageDocumentation
  */
+import { z } from "zod";
+
 import { REFRESH_SECONDS } from "./gather.ts";
+import { AnswerRequestSchema, NoteRequestSchema } from "./schemas.ts";
 import { plural } from "./status.ts";
-import { ACTIVITY_LIMIT, STEP_NAMES, STEP_STATUSES, TASK_STATES } from "./types.ts";
+import {
+  ACTIVITY_LIMIT,
+  ActivityEventSchema,
+  ApiErrorSchema,
+  BearingsSchema,
+  CountsSchema,
+  DecisionSchema,
+  FindingSchema,
+  HealthSchema,
+  LandedItemSchema,
+  NoteReceiptSchema,
+  PipelineSchema,
+  PipelineStepSchema,
+  PullRequestSchema,
+  QuestionOptionSchema,
+  QuestionSchema,
+  QueuedItemSchema,
+  ReadyToMergeSchema,
+  RefreshReceiptSchema,
+  TASK_STATES,
+  TaskLinksSchema,
+  TaskSchema,
+  WaitingOnYouSchema,
+} from "./types.ts";
 
 /** Any JSON value. */
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
@@ -21,22 +47,8 @@ type Schema = { [key: string]: Json };
 /** A schema for an array whose items match `items`. */
 const arrayOf = (items: Schema): Schema => ({ items, type: "array" });
 
-/** A schema that also allows `null`. */
-const nullable = (schema: Schema): Schema => ({ oneOf: [schema, { type: "null" }] });
-
 /** A reference to one of the named {@link schemas}. */
 const ref = (name: string): Schema => ({ $ref: `#/components/schemas/${name}` });
-
-/**
- * A string schema with a description.
- *
- * @param extra - More schema keywords, for example `{ format: "uri" }`.
- */
-const str = (description: string, extra: Schema = {}): Schema => ({
-  description,
-  type: "string",
-  ...extra,
-});
 
 /** The refresh interval in words, for example `5 minutes` or `90 seconds`. */
 const refreshInterval =
@@ -44,338 +56,65 @@ const refreshInterval =
     ? plural(REFRESH_SECONDS / 60, "minute")
     : plural(REFRESH_SECONDS, "second");
 
-/** A mutable copy of {@link STEP_NAMES}, since {@link Json} arrays are not readonly. */
-const stepNames = [...STEP_NAMES];
-
-/** The component schemas, one per type in `types.ts` that the API sends or accepts. */
-const schemas: Record<string, Schema> = {
-  ActivityEvent: {
-    additionalProperties: false,
-    properties: {
-      at: str("When it happened.", { format: "date-time" }),
-      kind: { enum: ["blocked", "decision_asked", "decision_made", "finished"], type: "string" },
-      taskId: str("Task id."),
-      taskName: str("Task name."),
-      text: str("One sentence."),
-    },
-    required: ["at", "kind", "taskId", "taskName", "text"],
-    type: "object",
-  },
-  AnswerRequest: {
-    additionalProperties: false,
-    properties: {
-      answers: {
-        description: "Each question may be answered only once.",
-        items: {
-          additionalProperties: false,
-          properties: {
-            answer: {
-              description: "One of the question's options, or your own words.",
-              maxLength: 2000,
-              minLength: 1,
-              type: "string",
-            },
-            question: {
-              description:
-                "The question number inside the decision. A decision with no structured questions is answered as question 1.",
-              minimum: 1,
-              type: "integer",
-            },
-          },
-          required: ["answer", "question"],
-          type: "object",
-        },
-        maxItems: 20,
-        minItems: 1,
-        type: "array",
-      },
-    },
-    required: ["answers"],
-    type: "object",
-  },
-  Bearings: {
-    additionalProperties: false,
-    description: "The whole picture of the fleet at one moment.",
-    properties: {
-      activity: arrayOf(ref("ActivityEvent")),
-      contributions: {
-        additionalProperties: false,
-        properties: {
-          checked: { type: "integer" },
-          complete: { type: "boolean" },
-          known: { type: "integer" },
-        },
-        required: ["checked", "complete", "known"],
-        type: "object",
-      },
-      counts: ref("Counts"),
-      error: nullable(
-        str(
-          "The last refresh error, if the latest rebuild failed. The data is then from the previous good snapshot.",
-        ),
-      ),
-      generatedAt: nullable(str("When this snapshot was built.", { format: "date-time" })),
-      nextRefreshAt: nullable(str("When the next rebuild is due.", { format: "date-time" })),
-      queued: arrayOf(ref("QueuedItem")),
-      recentlyLanded: arrayOf(ref("LandedItem")),
-      refreshing: { description: "True while a rebuild is running.", type: "boolean" },
-      underway: arrayOf(ref("Task")),
-      waitingOnYou: ref("WaitingOnYou"),
-    },
-    required: [
-      "activity",
-      "contributions",
-      "counts",
-      "error",
-      "generatedAt",
-      "nextRefreshAt",
-      "queued",
-      "recentlyLanded",
-      "refreshing",
-      "underway",
-      "waitingOnYou",
-    ],
-    type: "object",
-  },
-  Counts: {
-    additionalProperties: false,
-    properties: {
-      landed: { minimum: 0, type: "integer" },
-      queued: { minimum: 0, type: "integer" },
-      underway: { minimum: 0, type: "integer" },
-      waitingOnYou: { minimum: 0, type: "integer" },
-    },
-    required: ["landed", "queued", "underway", "waitingOnYou"],
-    type: "object",
-  },
-  Decision: {
-    additionalProperties: false,
-    description: "A set of questions that wait on the captain.",
-    properties: {
-      id: str("The id of the task the decision gates. Use it in the answers endpoint."),
-      questions: arrayOf(ref("Question")),
-      summary: str("One plain-English sentence."),
-      text: nullable(str("Free text when the decision has no structured questions.")),
-      title: str("Short title."),
-    },
-    required: ["id", "questions", "summary", "text", "title"],
-    type: "object",
-  },
-  Error: {
-    additionalProperties: false,
-    properties: {
-      error: {
-        additionalProperties: false,
-        properties: {
-          code: str("Stable machine-readable code."),
-          message: str("Plain-English explanation."),
-        },
-        required: ["code", "message"],
-        type: "object",
-      },
-    },
-    required: ["error"],
-    type: "object",
-  },
-  Finding: {
-    additionalProperties: false,
-    properties: {
-      id: str("Finding id, for example review-1."),
-      severity: { enum: ["error", "info", "warning"], type: "string" },
-      text: str("Plain description of the finding."),
-    },
-    required: ["id", "severity", "text"],
-    type: "object",
-  },
-  Health: {
-    additionalProperties: false,
-    properties: {
-      error: nullable(
-        str(
-          'Last refresh error. Without a valid key (when one is set) it is only "refresh failed".',
-        ),
-      ),
-      generatedAt: nullable(str("When the current snapshot was built.", { format: "date-time" })),
-      ok: { type: "boolean" },
-      ready: { description: "False until the first snapshot has been built.", type: "boolean" },
-      refreshing: { type: "boolean" },
-    },
-    required: ["error", "generatedAt", "ok", "ready", "refreshing"],
-    type: "object",
-  },
-  LandedItem: {
-    additionalProperties: false,
-    properties: {
-      id: str("Task id."),
-      kind: { enum: ["pull_request", "report"], type: "string" },
-      path: nullable(str("Report path on the Firstmate machine.")),
-      title: str("What landed."),
-      url: nullable(str("Pull request URL.", { format: "uri" })),
-    },
-    required: ["id", "kind", "path", "title", "url"],
-    type: "object",
-  },
-  NoteReceipt: {
-    additionalProperties: false,
-    properties: {
-      accepted: { const: true, type: "boolean" },
-      receivedAt: str("When the note was recorded.", { format: "date-time" }),
-    },
-    required: ["accepted", "receivedAt"],
-    type: "object",
-  },
-  NoteRequest: {
-    additionalProperties: false,
-    properties: {
-      text: {
-        description: "Anything you want Firstmate to read.",
-        maxLength: 4000,
-        minLength: 1,
-        type: "string",
-      },
-    },
-    required: ["text"],
-    type: "object",
-  },
-  Pipeline: {
-    additionalProperties: false,
-    description: "The no-mistakes validation run for a task.",
-    properties: {
-      findings: { ...arrayOf(ref("Finding")), description: "Findings at the current gate." },
-      gate: nullable({
-        additionalProperties: false,
-        description: "The step the run is held at, if any.",
-        properties: {
-          status: str("Gate status, for example awaiting_approval."),
-          step: { enum: stepNames, type: "string" },
-        },
-        required: ["status", "step"],
-        type: "object",
-      }),
-      runId: str("Run id."),
-      status: str("Run status as reported by no-mistakes, for example running or failed."),
-      steps: arrayOf(ref("PipelineStep")),
-      tool: { const: "no-mistakes", type: "string" },
-    },
-    required: ["findings", "gate", "runId", "status", "steps", "tool"],
-    type: "object",
-  },
-  PipelineStep: {
-    additionalProperties: false,
-    properties: {
-      findings: { description: "Findings raised by the step.", minimum: 0, type: "integer" },
-      name: { description: "Validation step.", enum: stepNames, type: "string" },
-      status: {
-        description: "unknown stands for a status this API does not recognise.",
-        enum: [...STEP_STATUSES],
-        type: "string",
-      },
-    },
-    required: ["findings", "name", "status"],
-    type: "object",
-  },
-  PullRequest: {
-    additionalProperties: false,
-    properties: {
-      number: { type: "integer" },
-      url: str("Pull request URL.", { format: "uri" }),
-    },
-    required: ["number", "url"],
-    type: "object",
-  },
-  Question: {
-    additionalProperties: false,
-    properties: {
-      number: { description: "1-based position inside its decision.", minimum: 1, type: "integer" },
-      options: { ...arrayOf(ref("QuestionOption")), maxItems: 4, minItems: 1 },
-      title: str("The question."),
-    },
-    required: ["number", "options", "title"],
-    type: "object",
-  },
-  QuestionOption: {
-    additionalProperties: false,
-    properties: {
-      recommended: { description: "True for the option Firstmate recommends.", type: "boolean" },
-      text: str("The option."),
-    },
-    required: ["recommended", "text"],
-    type: "object",
-  },
-  QueuedItem: {
-    additionalProperties: false,
-    properties: {
-      id: str("Task id."),
-      reason: str("Why it is waiting."),
-      title: str("Queued work."),
-    },
-    required: ["id", "reason", "title"],
-    type: "object",
-  },
-  ReadyToMerge: {
-    additionalProperties: false,
-    properties: {
-      name: str("Task name."),
-      pullRequest: ref("PullRequest"),
-      summary: str("One plain-English sentence."),
-      taskId: str("Task id."),
-    },
-    required: ["name", "pullRequest", "summary", "taskId"],
-    type: "object",
-  },
-  RefreshReceipt: {
-    additionalProperties: false,
-    properties: { accepted: { const: true, type: "boolean" } },
-    required: ["accepted"],
-    type: "object",
-  },
-  Task: {
-    additionalProperties: false,
-    properties: {
-      id: str("Stable task id."),
-      kind: {
-        description: "ship changes a project, scout investigates.",
-        enum: ["other", "scout", "ship"],
-        type: "string",
-      },
-      links: ref("TaskLinks"),
-      name: str("Human name of the task."),
-      pipeline: nullable(ref("Pipeline")),
-      repo: str("Repository the task works in."),
-      state: { description: "Machine-readable state.", enum: [...TASK_STATES], type: "string" },
-      status: str("One plain-English sentence describing where the task is."),
-    },
-    required: ["id", "kind", "links", "name", "pipeline", "repo", "state", "status"],
-    type: "object",
-  },
-  TaskLinks: {
-    additionalProperties: false,
-    properties: {
-      linear: nullable({
-        additionalProperties: false,
-        properties: {
-          key: str("Ticket key, for example LIV-3692."),
-          url: str("Ticket URL.", { format: "uri" }),
-        },
-        required: ["key", "url"],
-        type: "object",
-      }),
-      pullRequest: nullable(ref("PullRequest")),
-    },
-    required: ["linear", "pullRequest"],
-    type: "object",
-  },
-  WaitingOnYou: {
-    additionalProperties: false,
-    description: "Decisions with their questions, plus pull requests ready to merge.",
-    properties: {
-      decisions: arrayOf(ref("Decision")),
-      readyToMerge: arrayOf(ref("ReadyToMerge")),
-    },
-    required: ["decisions", "readyToMerge"],
-    type: "object",
-  },
+/**
+ * The Zod schemas that become the spec's component schemas, by component name. Every schema
+ * the API sends or accepts is listed here; schemas used inside them become `$ref`s.
+ */
+const componentSchemas: Record<string, z.ZodType> = {
+  ActivityEvent: ActivityEventSchema,
+  AnswerRequest: AnswerRequestSchema,
+  Bearings: BearingsSchema,
+  Counts: CountsSchema,
+  Decision: DecisionSchema,
+  Error: ApiErrorSchema,
+  Finding: FindingSchema,
+  Health: HealthSchema,
+  LandedItem: LandedItemSchema,
+  NoteReceipt: NoteReceiptSchema,
+  NoteRequest: NoteRequestSchema,
+  Pipeline: PipelineSchema,
+  PipelineStep: PipelineStepSchema,
+  PullRequest: PullRequestSchema,
+  Question: QuestionSchema,
+  QuestionOption: QuestionOptionSchema,
+  QueuedItem: QueuedItemSchema,
+  ReadyToMerge: ReadyToMergeSchema,
+  RefreshReceipt: RefreshReceiptSchema,
+  Task: TaskSchema,
+  TaskLinks: TaskLinksSchema,
+  WaitingOnYou: WaitingOnYouSchema,
 };
+
+/**
+ * Turn {@link componentSchemas} into JSON Schema for `components.schemas`.
+ *
+ * @remarks
+ * `z.toJSONSchema` writes each schema as a standalone document with `$schema` and `$id`; those
+ * are dropped, since a component is part of the OpenAPI document. Schemas that refer to one
+ * another get `$ref`s to `#/components/schemas/<name>`.
+ */
+function buildComponentSchemas(): Record<string, Schema> {
+  const registry = z.registry<{ id: string }>();
+
+  for (const [id, schema] of Object.entries(componentSchemas)) {
+    registry.add(schema, { id });
+  }
+
+  const { schemas: generated } = z.toJSONSchema(registry, {
+    target: "draft-2020-12",
+    uri: (id) => `#/components/schemas/${id}`,
+  });
+
+  return Object.fromEntries(
+    Object.entries(generated).map(([id, { $id: _id, $schema: _schema, ...schema }]) => [
+      id,
+      schema as Schema,
+    ]),
+  );
+}
+
+/** The component schemas, generated from the Zod schemas in `types.ts` and `schemas.ts`. */
+const schemas = buildComponentSchemas();
 
 /** A response whose body is the `Error` schema. */
 const errorResponse = (description: string): Schema => jsonBody("Error", description);
@@ -388,6 +127,16 @@ const idParam: Schema = {
   required: true,
   schema: { type: "string" },
 };
+/** The optional `Idempotency-Key` header of the write endpoints. */
+const idempotencyKeyParam: Schema = {
+  description:
+    "Retry a write with the same key and the note is recorded once. 1 to 128 letters, digits or ._:-",
+  in: "header",
+  name: "Idempotency-Key",
+  required: false,
+  schema: { pattern: "^[A-Za-z0-9._:-]{1,128}$", type: "string" },
+};
+
 /** A response whose JSON body matches the named schema. */
 const jsonBody = (name: string, description: string): Schema => ({
   content: { "application/json": { schema: ref(name) } },
@@ -437,13 +186,16 @@ const paths: Record<string, Record<string, Schema>> = {
   "/api/v1/notes": {
     post: {
       operationId: "sendNote",
+      parameters: [idempotencyKeyParam],
       requestBody: {
         content: { "application/json": { schema: ref("NoteRequest") } },
         required: true,
       },
       responses: {
         "202": jsonBody("NoteReceipt", "Accepted and recorded."),
-        "400": errorResponse("The request body is not valid JSON or is the wrong shape."),
+        "400": errorResponse(
+          "The request body is not valid JSON or is the wrong shape, or the Idempotency-Key is malformed.",
+        ),
         "415": errorResponse("Content-Type must be application/json."),
         "502": errorResponse("The note could not be recorded."),
       },
@@ -481,14 +233,19 @@ const paths: Record<string, Record<string, Schema>> = {
       description:
         "Sends your answers to Firstmate as an inbox note. Firstmate reads it and records the decision; the question stays listed until it does.",
       operationId: "answerDecision",
-      parameters: [{ ...idParam, description: "Decision id (the task it gates)." }],
+      parameters: [
+        { ...idParam, description: "Decision id (the task it gates)." },
+        idempotencyKeyParam,
+      ],
       requestBody: {
         content: { "application/json": { schema: ref("AnswerRequest") } },
         required: true,
       },
       responses: {
         "202": jsonBody("NoteReceipt", "Accepted and recorded as a note."),
-        "400": errorResponse("The request body is not valid JSON or is the wrong shape."),
+        "400": errorResponse(
+          "The request body is not valid JSON or is the wrong shape, or the Idempotency-Key is malformed.",
+        ),
         "404": errorResponse("No such open decision."),
         "415": errorResponse("Content-Type must be application/json."),
         "422": errorResponse("A question number does not exist in the decision."),

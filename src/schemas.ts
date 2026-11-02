@@ -3,33 +3,27 @@
  * path ids, the snapshot script's JSON, and task meta files.
  *
  * @remarks
- * Each schema is checked against its type in `types.ts` with `satisfies`, so the two cannot
- * drift. Environment variables have their own schema in `env.ts`.
+ * The types of these inputs are inferred from the schemas, so the two cannot drift. The request
+ * body schemas also become the spec's `AnswerRequest` and `NoteRequest` components (see
+ * `openapi.ts`). Environment variables have their own schema in `env.ts`.
  *
  * @packageDocumentation
  */
 import { z } from "zod";
 
 import { ACTIVITY_LIMIT, TASK_STATES } from "./types.ts";
-import type {
-  AnswerRequest,
-  NoteRequest,
-  RawDecision,
-  RawGate,
-  RawLanded,
-  RawRecordedPr,
-  RawSnapshot,
-  RawTask,
-} from "./types.ts";
 
 // ---------- requests ----------
 
-/** The `limit` query parameter of `GET /api/v1/activity`. */
-export const ActivityLimitSchema = z.coerce
-  .number()
-  .int()
-  .min(1)
-  .max(ACTIVITY_LIMIT)
+/**
+ * The `limit` query parameter of `GET /api/v1/activity`: plain digits, from 1 to
+ * {@link ACTIVITY_LIMIT}, which is also the default. Forms like `0x10` or `1e1` are refused.
+ */
+export const ActivityLimitSchema = z
+  .string()
+  .regex(/^\d+$/)
+  .transform(Number)
+  .pipe(z.int().min(1).max(ACTIVITY_LIMIT))
   .default(ACTIVITY_LIMIT);
 
 /**
@@ -44,24 +38,57 @@ export const AnswerRequestSchema = z.strictObject({
   answers: z
     .array(
       z.strictObject({
-        answer: z.string().max(2000).trim().min(1),
-        question: z.int().min(1),
+        answer: z
+          .string()
+          .max(2000)
+          .trim()
+          .min(1)
+          .meta({ description: "One of the question's options, or your own words." }),
+        question: z.int().min(1).meta({
+          description:
+            "The question number inside the decision. A decision with no structured questions is answered as question 1.",
+        }),
       }),
     )
     .min(1)
     .max(20)
     .refine((answers) => new Set(answers.map((item) => item.question)).size === answers.length, {
       error: "Each question may be answered only once.",
-    }),
-}) satisfies z.ZodType<AnswerRequest>;
+    })
+    .meta({ description: "One entry per question answered. Each question may be answered once." }),
+});
+
+/** See {@link AnswerRequestSchema}. */
+export type AnswerRequest = z.infer<typeof AnswerRequestSchema>;
 
 /** A task or decision id in a path. */
 export const IdSchema = z.string().regex(/^[A-Za-z0-9._-]+$/);
 
+/**
+ * The optional `Idempotency-Key` header of the write endpoints.
+ *
+ * @remarks
+ * It becomes the inbox note's request id, so a client that retries with the same key does not
+ * record the note twice. It is limited to 1 to 128 letters, digits and `._:-`, since it is
+ * passed to `fm-inbox.sh` as an argument.
+ */
+export const IdempotencyKeySchema = z
+  .string()
+  .regex(/^[A-Za-z0-9._:-]{1,128}$/)
+  .optional();
+
 /** Body of `POST /api/v1/notes`: only a `text` key, non-blank and at most 4000 characters. */
 export const NoteRequestSchema = z.strictObject({
-  text: z.string().max(4000).trim().min(1),
-}) satisfies z.ZodType<NoteRequest>;
+  text: z
+    .string()
+    .max(4000)
+    .trim()
+    .min(1)
+    .meta({ description: "Anything you want Firstmate to read." }),
+});
+
+/** See {@link NoteRequestSchema}. */
+export type NoteRequest = z.infer<typeof NoteRequestSchema>;
 
 /** The `state` query parameter of `GET /api/v1/tasks`. */
 export const TaskStateFilterSchema = z.enum(TASK_STATES).optional();
@@ -132,17 +159,14 @@ export const RawSnapshotSchema = z.object(
       },
       { error: CONTRIBUTIONS_ERROR },
     ),
-    decisions_open: list(
-      "decisions_open",
-      item({ id: text("id"), summary: text("summary") }) satisfies z.ZodType<RawDecision>,
-    ),
+    decisions_open: list("decisions_open", item({ id: text("id"), summary: text("summary") })),
     gates: list(
       "gates",
       item({
         id: optionalText("id"),
         reason: optionalText("reason"),
         title: optionalText("title"),
-      }) satisfies z.ZodType<RawGate>,
+      }),
     ),
     in_flight: list(
       "in_flight",
@@ -152,7 +176,7 @@ export const RawSnapshotSchema = z.object(
         kind: text("kind"),
         name: text("name"),
         repo: text("repo"),
-      }) satisfies z.ZodType<RawTask>,
+      }),
     ),
     landed: list(
       "landed",
@@ -160,15 +184,27 @@ export const RawSnapshotSchema = z.object(
         artifact: text("artifact"),
         id: text("id"),
         what: text("what"),
-      }) satisfies z.ZodType<RawLanded>,
+      }),
     ),
-    recorded_prs: list(
-      "recorded_prs",
-      item({ id: text("id"), url: text("url") }) satisfies z.ZodType<RawRecordedPr>,
-    ),
+    recorded_prs: list("recorded_prs", item({ id: text("id"), url: text("url") })),
   },
   { error: "is not a JSON object" },
-) satisfies z.ZodType<RawSnapshot>;
+);
+
+/** The fields this API reads from the snapshot script's JSON (see {@link RawSnapshotSchema}). */
+export type RawSnapshot = z.infer<typeof RawSnapshotSchema>;
+
+/** An open decision. Its `summary` is `Title: details`; the title becomes the decision title. */
+export type RawDecision = RawSnapshot["decisions_open"][number];
+
+/** A gate holding queued work. Every field may be missing. */
+export type RawGate = RawSnapshot["gates"][number];
+
+/** Something that landed. `artifact` is a pull request URL, or a report path. */
+export type RawLanded = RawSnapshot["landed"][number];
+
+/** A task in flight. `doing` is the script's own status line, used when the crew script gives nothing. */
+export type RawTask = RawSnapshot["in_flight"][number];
 
 // ---------- task meta files ----------
 

@@ -9,7 +9,7 @@ TypeScript on [Hono](https://hono.dev) (served by `@hono/node-server`), with [Zo
 It reads a Firstmate home, so run it on the machine that has one.
 
 ```sh
-pnpm install       # Zod, plus the dev tools: the TypeScript compiler, oxlint, oxfmt and the spec validators
+pnpm install       # Hono and Zod, plus the dev tools: the TypeScript compiler, oxlint, oxfmt and the spec validators
 cp .env.example .env.local   # optional: settings (see below)
 pnpm start         # http://localhost:4748
 ```
@@ -33,9 +33,13 @@ Data is rebuilt every 5 minutes by default (`BEARINGS_API_REFRESH`). `POST /api/
 | POST   | `/api/v1/refresh`                             | Rebuild now                                                          |
 | GET    | `/health`                                     | Health                                                               |
 
-The API never answers a decision, merges, or changes a task. Answers and notes become Firstmate inbox notes that it reads. A decision with no structured questions is answered as question 1.
+The API never answers a decision, merges, or changes a task. Answers and notes become Firstmate inbox notes that it reads. A decision with no structured questions is answered as question 1. Send an `Idempotency-Key` header (1 to 128 letters, digits or `._:-`) with an answer or note and a retry with the same key is recorded once.
 
-Writes (`POST`) that carry an `Origin` header from another site get a 403, so a web page cannot post to the API from your browser. If the first snapshot fails, it is retried every 30 seconds and the 503 says why.
+A pull request is listed as ready to merge when its checks are green and `gh pr view` does not say it is merged or closed. If `gh` cannot be asked, it is still listed.
+
+Writes (`POST`) that carry an `Origin` header for any other origin (another site, or another port on this machine) get a 403, so a web page cannot post to the API from your browser. If the first snapshot fails, it is retried every 30 seconds and the 503 says why.
+
+On SIGINT or SIGTERM the server stops every script it started before it exits.
 
 ## Settings
 
@@ -55,7 +59,7 @@ Writes (`POST`) that carry an `Origin` header from another site get a 403, so a 
 
 `.env.example` lists them all. Copy it to `.env.local` (not committed): `pnpm start` and `start.sh` both read it, and variables already set in the environment win. Blank values count as unset. A bad value (a port that is not a number, a Linear base that is not an http(s) URL, a team key with symbols) stops the server at startup with a message naming each bad variable.
 
-`start.sh` also takes `BEARINGS_API_NODE` (the node binary), `BEARINGS_API_PID_FILE` and `BEARINGS_API_LOG_FILE` (default `server.pid` and `server.log` in the repo).
+`start.sh` also takes `BEARINGS_API_NODE` (the node binary), `BEARINGS_API_PID_FILE` and `BEARINGS_API_LOG_FILE` (default `server.pid` and `server.log` in the repo). It ignores a stale pidfile, and exits 1 with the end of the log when the server does not start.
 
 ## Checks
 
@@ -70,6 +74,6 @@ pnpm check --fixture  # starts its own server on the fixed Firstmate home in fix
                       # runs every check, plus the exact values that home should give (CI runs this)
 ```
 
-`fixtures/home` has stub `bin/` scripts (and a `no-mistakes` stub, used via `BEARINGS_NO_MISTAKES_BIN`) that print fixed output. When you change what the API reads from Firstmate, update the stubs and the `fixture:` checks in `scripts/check.ts` to match.
+`fixtures/home` has stub `bin/` scripts (and `gh` and `no-mistakes` stubs, used via `BEARINGS_GH_BIN` and `BEARINGS_NO_MISTAKES_BIN`) that print fixed output. The check runs it from a temporary copy and writes its status file there with fresh timestamps. When you change what the API reads from Firstmate, update the stubs and the `fixture:` checks in `scripts/check.ts` to match.
 
-The spec is in `src/openapi.ts` and mirrors the types in `src/types.ts`.
+The response shapes are Zod schemas in `src/types.ts`. The spec in `src/openapi.ts` generates its component schemas from them, so the spec and the types cannot drift; the operations are written by hand there.

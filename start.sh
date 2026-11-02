@@ -15,8 +15,15 @@ export FM_HOME="${FM_HOME:-$(cd "$here/../.." && pwd)}"
 node_bin="${BEARINGS_API_NODE:-node}"
 pidfile="${BEARINGS_API_PID_FILE:-$here/server.pid}"
 logfile="${BEARINGS_API_LOG_FILE:-$here/server.log}"
-if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-  echo "already running (pid $(cat "$pidfile"))"
+# The pidfile counts only when its process is alive and is this server: a stale pidfile's
+# number may have been reused by an unrelated process.
+running_pid() {
+  [ -f "$pidfile" ] || return 1
+  pid="$(cat "$pidfile")"
+  kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o command= 2>/dev/null | grep -q "src/server.ts"
+}
+if running_pid; then
+  echo "already running (pid $pid)"
 else
   # setsid detaches from the terminal's session where it exists (Linux); macOS has no setsid.
   detach=""
@@ -24,5 +31,11 @@ else
   $detach nohup "$node_bin" "$here/src/server.ts" >>"$logfile" 2>&1 </dev/null &
   echo $! >"$pidfile"
   sleep 2
+  if ! running_pid; then
+    rm -f "$pidfile"
+    echo "failed to start; the end of $logfile:" >&2
+    tail -n 20 "$logfile" >&2
+    exit 1
+  fi
 fi
 echo "http://localhost:${BEARINGS_API_PORT:-4748}/docs"

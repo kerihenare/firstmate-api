@@ -13,6 +13,9 @@
  * Hono runs middleware and handlers in the order they are registered, and stops at the first
  * one that returns a response, so the order of the `app.*` calls below is the order above.
  *
+ * On SIGINT or SIGTERM the server stops listening and stops every command a rebuild or write
+ * started (see `stopCommands`) before it exits.
+ *
  * @packageDocumentation
  */
 import { timingSafeEqual } from "node:crypto";
@@ -28,18 +31,20 @@ import {
   sendAnswers,
   sendGeneralNote,
   status,
+  stopCommands,
 } from "./gather.ts";
 import type { AnswerOutcome } from "./gather.ts";
 import { openapi } from "./openapi.ts";
 import {
   ActivityLimitSchema,
   AnswerRequestSchema,
+  IdempotencyKeySchema,
   IdSchema,
   NoteRequestSchema,
   TaskStateFilterSchema,
 } from "./schemas.ts";
 import { ACTIVITY_LIMIT, TASK_STATES } from "./types.ts";
-import type { ApiError, Bearings, NoteReceipt, RefreshReceipt } from "./types.ts";
+import type { ApiError, Bearings, Health, NoteReceipt, RefreshReceipt } from "./types.ts";
 
 // ---------- settings ----------
 
@@ -75,6 +80,9 @@ const PORT = settings.port;
 /** Every HTTP status an error response can carry. */
 type ErrorStatus = 400 | 401 | 403 | 404 | 413 | 415 | 421 | 422 | 500 | 502 | 503;
 
+/** The outcome of {@link readIdempotencyKey}: the key, or `ok: false` when it is malformed. */
+type IdempotencyKey = { ok: true; value: string | undefined } | { ok: false };
+
 /** The outcome of {@link readJson}: the parsed body, or the error response to send instead. */
 type JsonBody =
   | { ok: true; value: unknown }
@@ -89,6 +97,17 @@ type JsonBody =
     };
 
 // ---------- request parsing ----------
+
+/**
+ * The optional `Idempotency-Key` header (see {@link IdempotencyKeySchema}).
+ *
+ * @returns The key, `undefined` when the header is absent, or `ok: false` when it is malformed.
+ */
+function readIdempotencyKey(c: Context): IdempotencyKey {
+  const parsed = IdempotencyKeySchema.safeParse(c.req.header("idempotency-key"));
+
+  return parsed.success ? { ok: true, value: parsed.data } : { ok: false };
+}
 
 /**
  * The `id` path parameter, when it is valid.
@@ -163,15 +182,16 @@ function isRead(c: Context): boolean {
  * Whether the request carries the API key as a bearer token. Always true when no key is set.
  *
  * @remarks
- * The comparison takes the same time however much of the key matches, so the key cannot be
- * guessed one character at a time.
+ * The `Bearer` scheme name is matched in any case, as RFC 9110 requires. The comparison takes the
+ * same time however much of the key matches, so the key cannot be guessed one character at a
+ * time.
  */
 function keyOk(c: Context): boolean {
   if (!API_KEY) {
     return true;
   }
 
-  const given = /^Bearer (.+)$/.exec(c.req.header("authorization") ?? "")?.[1] ?? "";
+  const given = /^bearer (.+)$/i.exec(c.req.header("authorization") ?? "")?.[1] ?? "";
   const givenBytes = Buffer.from(given);
   const keyBytes = Buffer.from(API_KEY);
 
@@ -182,8 +202,11 @@ function keyOk(c: Context): boolean {
  * Whether a write may go ahead, judged by its Origin header.
  *
  * @remarks
- * Browsers send Origin on cross-site writes, so a write from a page on another site (CSRF) is
- * refused. Callers that send no Origin, such as curl and scripts, are unaffected.
+ * Browsers send Origin on cross-origin writes, so a write from any other page (CSRF) is
+ * refused, including one served from another port on the same machine. The Origin's host and
+ * port must match the Host header, which {@link hostOk} has already checked. An Origin of
+ * `null` (a sandboxed frame or a local file) is refused too. Callers that send no Origin, such
+ * as curl and scripts, are unaffected.
  */
 function originOk(c: Context): boolean {
   const origin = c.req.header("origin");
@@ -192,13 +215,23 @@ function originOk(c: Context): boolean {
     return true;
   }
   try {
-    return ALLOWED_HOSTS.has(new URL(origin).hostname.toLowerCase());
+    return new URL(origin).host === (c.req.header("host") ?? "").toLowerCase();
   } catch {
     return false;
   }
 }
 
 // ---------- responses ----------
+
+/** Respond 400 because the `Idempotency-Key` header is malformed. */
+function badIdempotencyKey(c: Context): Response {
+  return fail(
+    c,
+    400,
+    "invalid_idempotency_key",
+    "Idempotency-Key must be 1 to 128 letters, digits or ._:-",
+  );
+}
 
 /**
  * Run an inbox write and respond with a receipt (202), or with an error when the write is
@@ -305,11 +338,12 @@ app.get("/openapi.json", (c) => c.json(openapi));
 app.get("/docs", (c) => c.html(DOCS));
 app.get("/", (c) => c.html(DOCS));
 app.get("/health", (c) => {
-  const health = status();
+  const cache = status();
   // The error text can name local paths, so only callers with the key see it.
-  const error = health.error && !keyOk(c) ? "refresh failed" : health.error;
+  const error = cache.error && !keyOk(c) ? "refresh failed" : cache.error;
+  const health: Health = { ...cache, error, ok: true };
 
-  return c.json({ ok: true, ...health, error });
+  return c.json(health);
 });
 
 // Everything below needs the key, including unknown paths.
@@ -385,6 +419,12 @@ app.get("/api/v1/tasks/:id", (c) => {
 });
 
 app.post("/api/v1/notes", async (c) => {
+  const idempotencyKey = readIdempotencyKey(c);
+
+  if (!idempotencyKey.ok) {
+    return badIdempotencyKey(c);
+  }
+
   const body = await readJson(c);
 
   if (!body.ok) {
@@ -398,7 +438,7 @@ app.post("/api/v1/notes", async (c) => {
   }
 
   return deliver(c, async () => {
-    await sendGeneralNote(request.data.text);
+    await sendGeneralNote(request.data.text, idempotencyKey.value);
 
     return { ok: true };
   });
@@ -413,6 +453,12 @@ app.post("/api/v1/questions/:id/answers", async (c) => {
   // Answers are checked against the open decisions, so there must be a snapshot.
   if (!getBearings()) {
     return notReady(c);
+  }
+
+  const idempotencyKey = readIdempotencyKey(c);
+
+  if (!idempotencyKey.ok) {
+    return badIdempotencyKey(c);
   }
 
   const body = await readJson(c);
@@ -430,7 +476,7 @@ app.post("/api/v1/questions/:id/answers", async (c) => {
     return fail(c, 400, "invalid_body", expected);
   }
 
-  return deliver(c, () => sendAnswers(answersFor, request.data));
+  return deliver(c, () => sendAnswers(answersFor, request.data, idempotencyKey.value));
 });
 
 app.post("/api/v1/refresh", (c) => {
@@ -449,9 +495,32 @@ app.onError((error, c) => {
   return fail(c, 500, "internal_error", "Something went wrong.");
 });
 
-// ---------- start ----------
+// ---------- start and stop ----------
+
+/** True once a shutdown signal has arrived, so a second one does not start another shutdown. */
+let shuttingDown = false;
 
 refreshInBackground();
-serve({ fetch: app.fetch, hostname: HOST, port: PORT }, () => {
+
+const server = serve({ fetch: app.fetch, hostname: HOST, port: PORT }, () => {
   console.log(`bearings-api on http://localhost:${PORT}/  (docs: /docs, spec: /openapi.json)`);
 });
+
+/**
+ * Stop listening, stop every running command, and exit.
+ *
+ * @param signal - The signal that asked for the shutdown, for the log.
+ */
+async function shutDown(signal: NodeJS.Signals): Promise<void> {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  console.log(`bearings-api: ${signal}, stopping`);
+  server.close();
+  await stopCommands();
+  process.exit(0);
+}
+
+process.on("SIGINT", (signal) => void shutDown(signal));
+process.on("SIGTERM", (signal) => void shutDown(signal));

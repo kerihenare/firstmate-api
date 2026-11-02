@@ -8,10 +8,12 @@
  *
  * `--offline` stops after the spec and parser checks, so it needs no server or Firstmate home.
  *
- * `--fixture` starts its own server on a free port, reading the fixed Firstmate home in
- * `fixtures/home` (stub scripts, plus a `no-mistakes` stub named by `BEARINGS_NO_MISTAKES_BIN`), with an API key
- * and Linear settings. It then runs every check, plus checks of the exact values that home
- * should produce. This is what CI runs.
+ * `--fixture` copies the fixed Firstmate home in `fixtures/home` (stub scripts, plus `gh` and
+ * `no-mistakes` stubs named by `BEARINGS_GH_BIN` and `BEARINGS_NO_MISTAKES_BIN`) to a temporary
+ * directory, writes a status file with timestamps relative to now, and starts its own server on
+ * it on a free port, with an API key and Linear settings. It then runs every check, plus checks
+ * of the exact values that home should produce, and sends a note and an answer to the stub
+ * inbox. This is what CI runs.
  *
  * Otherwise, set `BEARINGS_API_KEY` to the server's key when it has one; the 401 case is then
  * checked too. The process exits with 1 when any check fails.
@@ -19,7 +21,10 @@
  * @packageDocumentation
  */
 import { spawn } from "node:child_process";
+import { readFileSync, rmSync } from "node:fs";
+import { cp, mkdtemp, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,6 +37,7 @@ import { openapi } from "../src/openapi.ts";
 import { ActivityLimitSchema, AnswerRequestSchema, NoteRequestSchema } from "../src/schemas.ts";
 import {
   describeTask,
+  parseHoldReason,
   parsePipeline,
   parseQuestions,
   parseSnapshot,
@@ -43,8 +49,12 @@ import type { Bearings } from "../src/types.ts";
 
 /** Options for {@link call}. */
 interface CallOptions {
+  /** An Authorization header to send instead of the usual `Bearer <key>`. */
+  authorization?: string;
   /** The request body. */
   body?: string;
+  /** An Idempotency-Key header. */
+  idempotencyKey?: string;
   /** Leave out the API key, to check the 401 case. */
   noKey?: boolean;
   /** An Origin header, to check the cross-site write case. */
@@ -69,6 +79,8 @@ const args = process.argv.slice(2);
 const fixture = args.includes("--fixture");
 const key = fixture ? FIXTURE_KEY : (process.env["BEARINGS_API_KEY"] ?? "");
 const offline = args.includes("--offline");
+/** The fixture home in use under `--fixture` (a temporary copy), or `""` otherwise. */
+let fixtureHome = "";
 /** The API under test. Replaced by the fixture server's address under `--fixture`. */
 let base = args.find((arg) => !arg.startsWith("--")) ?? "http://127.0.0.1:4748";
 
@@ -109,8 +121,13 @@ ajv.addSchema({ $id: "spec", components: openapi["components"] as { schemas: unk
 async function call(method: string, path: string, options: CallOptions = {}): Promise<CallResult> {
   const headers: Record<string, string> = {};
 
-  if (key && !options.noKey) {
+  if (options.authorization) {
+    headers["Authorization"] = options.authorization;
+  } else if (key && !options.noKey) {
     headers["Authorization"] = `Bearer ${key}`;
+  }
+  if (options.idempotencyKey) {
+    headers["Idempotency-Key"] = options.idempotencyKey;
   }
   if (options.type) {
     headers["Content-Type"] = options.type;
@@ -148,19 +165,50 @@ function freePort(): Promise<number> {
 }
 
 /**
- * Start the API against `fixtures/home` on a free port. It is stopped when this script exits.
+ * Copy `fixtures/home` to a temporary directory and write its status file.
  *
+ * @remarks
+ * The activity feed only reports events from the last 24 hours, so the status file is written
+ * with timestamps relative to now rather than committed. It also has an event that is too old
+ * and one with a timestamp in milliseconds, which must both be left out. The copy is deleted
+ * when this script exits.
+ *
+ * @returns The temporary home's path.
+ */
+async function makeFixtureHome(): Promise<string> {
+  const repo = fileURLToPath(new URL("..", import.meta.url));
+  const home = await mkdtemp(path.join(tmpdir(), "bearings-fixture-"));
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const statusLines = [
+    `done [at=${nowSeconds - 3600}]: Shipped the first half of the fix.`,
+    `blocked [at=${nowSeconds - 60}]: Waiting on a test database.`,
+    `done [at=${nowSeconds - 2 * 86_400}]: An event from two days ago, past the window.`,
+    `done [at=${nowSeconds * 1000}]: A timestamp in milliseconds, which is not seconds.`,
+  ];
+
+  process.on("exit", () => rmSync(home, { force: true, recursive: true }));
+  await cp(path.join(repo, "fixtures", "home"), home, { recursive: true });
+  await writeFile(path.join(home, "state", "ship-1.status"), `${statusLines.join("\n")}\n`);
+
+  return home;
+}
+
+/**
+ * Start the API against a copy of `fixtures/home` on a free port. It is stopped when this
+ * script exits, and this script fails at once if the server exits first.
+ *
+ * @param home - The fixture home (see {@link makeFixtureHome}).
  * @returns The server's base URL.
  */
-async function startFixtureServer(): Promise<string> {
+async function startFixtureServer(home: string): Promise<string> {
   const port = await freePort();
   const repo = fileURLToPath(new URL("..", import.meta.url));
-  const home = path.join(repo, "fixtures", "home");
   const server = spawn(process.execPath, [path.join(repo, "src", "server.ts")], {
     env: {
       ...process.env,
       BEARINGS_API_KEY: FIXTURE_KEY,
       BEARINGS_API_PORT: String(port),
+      BEARINGS_GH_BIN: path.join(home, "bin", "gh"),
       BEARINGS_LINEAR_BASE: "https://linear.example/issue/",
       BEARINGS_LINEAR_TEAMS: "LIV",
       BEARINGS_NO_MISTAKES_BIN: path.join(home, "bin", "no-mistakes"),
@@ -169,7 +217,14 @@ async function startFixtureServer(): Promise<string> {
     stdio: ["ignore", "ignore", "inherit"],
   });
 
-  process.on("exit", () => server.kill());
+  server.on("exit", (code, signal) => {
+    fail(`the fixture server exited early (${signal ?? `code ${code}`})`);
+    process.exit(1);
+  });
+  process.on("exit", () => {
+    server.removeAllListeners("exit");
+    server.kill();
+  });
 
   return `http://127.0.0.1:${port}`;
 }
@@ -261,7 +316,15 @@ function checkFixtureValues(bearings: Bearings): void {
     ]),
     [
       ["scout-1", "Engine choice", ["Engine", "Flag"], null],
-      ["free-1", "Old flag", [], "Should the old flag stay for one more release?"],
+      ["free-1", "Old flag", [], 'Should the "old" flag stay for one more release?'],
+    ],
+  );
+  expectEqual(
+    "fixture: activity keeps the last day and skips bad timestamps",
+    bearings.activity.map((event) => [event.kind, event.taskName, event.text]),
+    [
+      ["blocked", "Fix LIV-42 login bug", "Waiting on a test database."],
+      ["finished", "Fix LIV-42 login bug", "Shipped the first half of the fix."],
     ],
   );
   expectEqual(
@@ -273,11 +336,66 @@ function checkFixtureValues(bearings: Bearings): void {
       bearings.counts,
     ],
     [
+      // done-2's pull request is merged on GitHub, so it is not waiting.
       [["done-1", 7]],
       ["pull_request", "report"],
       ["queued-1"],
       { landed: 2, queued: 1, underway: 2, waitingOnYou: 3 },
     ],
+  );
+}
+
+/**
+ * Send a note and an answer to the fixture's stub inbox, and check what it received.
+ *
+ * @remarks
+ * Only run against the fixture, since against a real home these would reach Firstmate.
+ */
+async function checkFixtureWrites(): Promise<void> {
+  const json = "application/json";
+
+  expect(
+    "fixture: POST note with an Idempotency-Key",
+    await call("POST", "/api/v1/notes", {
+      body: '{"text":"Hello from the check."}',
+      idempotencyKey: "check-note-1",
+      type: json,
+    }),
+    202,
+    validator("NoteReceipt"),
+  );
+  expect(
+    "fixture: POST answers",
+    await call("POST", "/api/v1/questions/scout-1/answers", {
+      body: JSON.stringify({ answers: [{ answer: "Stub", question: 1 }] }),
+      type: json,
+    }),
+    202,
+    validator("NoteReceipt"),
+  );
+  expect(
+    "fixture: POST note with a malformed Idempotency-Key",
+    await call("POST", "/api/v1/notes", {
+      body: '{"text":"x"}',
+      idempotencyKey: "has spaces",
+      type: json,
+    }),
+    400,
+    validator("Error"),
+  );
+
+  const inbox = readFileSync(path.join(fixtureHome, "inbox.log"), "utf8");
+  const requestIds = [...inbox.matchAll(/^request-id: (.*)$/gm)].map((match) => match[1]);
+
+  expectEqual(
+    "fixture: the inbox got the key as the request id, then a fresh UUID",
+    [
+      requestIds[0],
+      /^[0-9a-f-]{36}$/.test(requestIds[1] ?? ""),
+      inbox.includes("Hello from the check."),
+      inbox.includes("1. Engine → Stub"),
+    ],
+    ["check-note-1", true, true, true],
   );
 }
 
@@ -508,11 +626,22 @@ expectEqual(
   ],
 );
 expectEqual(
-  "ActivityLimitSchema defaults, coerces and bounds the limit",
-  [undefined, "3", "0", "17", "2.5", "abc"].map(
+  "ActivityLimitSchema defaults, reads plain digits and bounds the limit",
+  [undefined, "3", "0", "17", "2.5", "abc", "0x10", "1e1", ""].map(
     (limit) => ActivityLimitSchema.safeParse(limit).data ?? null,
   ),
-  [16, 3, null, null, null, null],
+  [16, 3, null, null, null, null, null, null, null],
+);
+expectEqual(
+  "parseHoldReason reads bare and quoted reasons, with escapes",
+  [
+    parseHoldReason('id: x\nhold_reason: "Pick \\"fast\\" or \\\\ not"\n'),
+    parseHoldReason("hold_reason: Plain words"),
+    parseHoldReason("hold_reason: -"),
+    parseHoldReason('hold_reason: "-"'),
+    parseHoldReason("nothing here"),
+  ],
+  ['Pick "fast" or \\ not', "Plain words", "", "", ""],
 );
 
 if (offline) {
@@ -522,7 +651,8 @@ if (offline) {
 
 // ---------- live API: wait for the first snapshot ----------
 if (fixture) {
-  base = await startFixtureServer();
+  fixtureHome = await makeFixtureHome();
+  base = await startFixtureServer(fixtureHome);
 }
 
 let ready = false;
@@ -579,6 +709,12 @@ if (key) {
     await call("GET", "/api/v1/bearings", { noKey: true }),
     401,
     validator("Error"),
+  );
+  expect(
+    "GET /api/v1/bearings with a lowercase bearer scheme",
+    await call("GET", "/api/v1/bearings", { authorization: `bearer ${key}` }),
+    200,
+    validator("Bearings"),
   );
 } else {
   console.log("  skip BEARINGS_API_KEY not set, so the 401 case was not exercised");
@@ -676,6 +812,12 @@ expect(
   validator("Error"),
 );
 expect(
+  "POST refresh from another port on this machine",
+  await call("POST", "/api/v1/refresh", { origin: "http://127.0.0.1:1" }),
+  403,
+  validator("Error"),
+);
+expect(
   "POST refresh from another site",
   await call("POST", "/api/v1/refresh", { origin: "https://evil.example" }),
   403,
@@ -704,6 +846,10 @@ if (decision) {
   );
 } else {
   console.log("  skip no open decision, so the 422 case was not exercised");
+}
+
+if (fixture) {
+  await checkFixtureWrites();
 }
 
 const spec = await call("GET", "/openapi.json");

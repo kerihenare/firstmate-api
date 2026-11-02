@@ -16,6 +16,9 @@ cat <<'JSON'
     { "artifact": "https://github.com/acme/app/pull/5", "id": "old-1", "what": "Faster startup" },
     { "artifact": "reports/old-2.md", "id": "old-2", "what": "Survey of caching options" }
   ],
-  "recorded_prs": [{ "id": "done-1", "url": "https://github.com/acme/app/pull/7" }]
+  "recorded_prs": [
+    { "id": "done-1", "url": "https://github.com/acme/app/pull/7" },
+    { "id": "done-2", "url": "https://github.com/acme/app/pull/8" }
+  ]
 }
 JSON

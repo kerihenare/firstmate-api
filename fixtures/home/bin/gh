@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Fixture for `pnpm check --fixture`: `pr view <url> --json state` gives each pull request's
+# state (pull/8 has been merged, the rest are open). Anything else prints nothing.
+if [ "$1 $2" = "pr view" ]; then
+  case "$3" in
+    */pull/8) echo MERGED ;;
+    *) echo OPEN ;;
+  esac
+fi

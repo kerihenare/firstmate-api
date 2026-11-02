@@ -12,16 +12,26 @@
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { open, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { stripVTControlCharacters } from "node:util";
 
 import { settings } from "./env.ts";
 import { TaskMetaSchema } from "./schemas.ts";
-import type { TaskMeta } from "./schemas.ts";
+import type {
+  AnswerRequest,
+  RawDecision,
+  RawGate,
+  RawLanded,
+  RawSnapshot,
+  RawTask,
+  TaskMeta,
+} from "./schemas.ts";
 import {
   describeTask,
   firstSentence,
+  parseHoldReason,
   parsePipeline,
   parseQuestions,
   parseSnapshot,
@@ -33,17 +43,12 @@ import {
 import { ACTIVITY_LIMIT } from "./types.ts";
 import type {
   ActivityEvent,
-  AnswerRequest,
   Bearings,
   Decision,
+  Health,
   LandedItem,
   Pipeline,
   QueuedItem,
-  RawDecision,
-  RawGate,
-  RawLanded,
-  RawSnapshot,
-  RawTask,
   ReadyToMerge,
   Task,
   TaskLinks,
@@ -58,8 +63,11 @@ import type {
  */
 export const FM_HOME = settings.fmHome;
 
-/** Status files untouched for longer than this are left out of the activity feed. */
+/** Events older than this are left out of the activity feed. */
 const ACTIVITY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** How many bytes from the end of each status file the activity feed reads at most. */
+const ACTIVITY_TAIL_BYTES = 64 * 1024;
 
 /** How many lines from the end of each status file the activity feed reads. */
 const ACTIVITY_TAIL_LINES = 80;
@@ -121,12 +129,19 @@ const RETRY_SECONDS = Math.min(30, REFRESH_SECONDS);
  * @remarks
  * Each task spawns up to five processes (crew, no-mistakes, git, gh, fm-tasks), and hold reasons
  * are read alongside with the same limit, so a refresh peaks at about 6 × TASK_CONCURRENCY
- * processes.
+ * processes. The pull request checks for {@link findReadyToMerge} come after, with the same
+ * limit.
  */
 const TASK_CONCURRENCY = 4;
 
+/** Every command {@link run} has started that has not finished yet, for {@link stopCommands}. */
+const liveChildren = new Set<ChildProcess>();
+
 /** `owner/name` slugs by project directory. Remotes rarely change, so they are kept for good. */
 const repoSlugCache = new Map<string, string>();
+
+/** True once {@link stopCommands} has been called. No more rebuilds start after that. */
+let stopping = false;
 
 // ---------- types ----------
 
@@ -162,17 +177,8 @@ interface RunResult {
   stdout: string;
 }
 
-/** The current state of the cache, as `GET /health` reports it. */
-export interface ServiceStatus {
-  /** The last refresh error, or `null` when the last refresh succeeded. */
-  error: string | null;
-  /** When the cached snapshot was built, or `null` before the first one. */
-  generatedAt: string | null;
-  /** Whether a snapshot exists yet. */
-  ready: boolean;
-  /** Whether a rebuild is running now. */
-  refreshing: boolean;
-}
+/** The current state of the cache: what `GET /health` reports, apart from `ok`. */
+export type ServiceStatus = Omit<Health, "ok">;
 
 /** What was learned about one task by running its scripts. */
 interface TaskInfo {
@@ -191,8 +197,10 @@ interface TaskInfo {
  *
  * @remarks
  * A status line looks like `done [at=1730600000]: Shipped the fix.`. Only lines with a known
- * prefix (see {@link EVENT_KIND}) and an `at` timestamp become events. Files that cannot be read
- * are skipped.
+ * prefix (see {@link EVENT_KIND}) and an `at` timestamp in epoch seconds (at most 10 digits)
+ * become events, and only events from the last {@link ACTIVITY_MAX_AGE_MS}. A line with a bad
+ * timestamp is skipped on its own. Files that cannot be read are skipped, and files untouched
+ * for longer than the maximum age are not opened.
  *
  * @param names - Task names by id, used to label each event.
  * @returns At most {@link ACTIVITY_LIMIT} events, newest first.
@@ -219,20 +227,24 @@ async function activityFeed(names: Map<string, string>): Promise<ActivityEvent[]
         continue;
       }
 
-      const lines = (await readFile(filePath, "utf8")).split("\n").slice(-ACTIVITY_TAIL_LINES);
+      const tail = await readTail(filePath, ACTIVITY_TAIL_BYTES);
+      const lines = tail.split("\n").slice(-ACTIVITY_TAIL_LINES);
 
       for (const line of lines) {
         // prefix, then zero or more ` [key=value]` tags, then `: text`.
         const match = /^([\w-]+)((?: \[[^\]]+\])*):\s*(.*)$/.exec(line);
         const kind = match?.[1] ? EVENT_KIND[match[1]] : undefined;
-        const atSeconds = match?.[2] ? /\[at=(\d+)\]/.exec(match[2])?.[1] : undefined;
+        // Ten digits of seconds reach the year 2286. More is not seconds (often milliseconds),
+        // and would make a date `toISOString` cannot write in the usual form.
+        const atSeconds = match?.[2] ? /\[at=(\d{1,10})\]/.exec(match[2])?.[1] : undefined;
+        const atMs = Number(atSeconds) * 1000;
 
-        if (!kind || !atSeconds) {
+        if (!kind || !atSeconds || now - atMs > ACTIVITY_MAX_AGE_MS) {
           continue;
         }
 
         events.push({
-          at: new Date(Number(atSeconds) * 1000).toISOString(),
+          at: new Date(atMs).toISOString(),
           kind,
           taskId,
           taskName: names.get(taskId) ?? taskId.replace(/-/g, " "),
@@ -283,7 +295,7 @@ async function build(): Promise<Bearings> {
   const decisions = raw.decisions_open.map((decision, i) =>
     toDecision(decision, holdReasons[i] || decision.summary),
   );
-  const readyToMerge = findReadyToMerge(raw, infoById, names);
+  const readyToMerge = await findReadyToMerge(raw, infoById, names);
   const recentlyLanded = raw.landed.map(toLandedItem);
   const queued = raw.gates.map(toQueuedItem);
 
@@ -323,16 +335,17 @@ async function crewLine(taskId: string): Promise<string> {
  * The pull requests waiting for the captain to merge.
  *
  * @remarks
- * A recorded pull request is ready when it has not landed yet and its task's crew line says
- * the checks are green.
+ * A recorded pull request is ready when it has not landed yet, its task's crew line says the
+ * checks are green, and GitHub does not say it is merged or closed (see {@link prStillOpen}).
+ * The last check catches pull requests merged long enough ago to have left the landed list.
  */
-function findReadyToMerge(
+async function findReadyToMerge(
   raw: RawSnapshot,
   infoById: Map<string, TaskInfo | undefined>,
   names: Map<string, string>,
-): ReadyToMerge[] {
+): Promise<ReadyToMerge[]> {
   const landedUrls = new Set(raw.landed.map((item) => item.artifact));
-  const ready: ReadyToMerge[] = [];
+  const candidates: ReadyToMerge[] = [];
 
   for (const pr of raw.recorded_prs) {
     if (landedUrls.has(pr.url)) {
@@ -348,7 +361,7 @@ function findReadyToMerge(
       continue;
     }
 
-    ready.push({
+    candidates.push({
       name: names.get(pr.id) ?? pr.id,
       pullRequest: { number, url: pr.url },
       summary: "Ready for you to review and merge.",
@@ -356,15 +369,18 @@ function findReadyToMerge(
     });
   }
 
-  return ready;
+  const open = await mapLimit(candidates, TASK_CONCURRENCY, (candidate) =>
+    prStillOpen(candidate.pullRequest.url),
+  );
+
+  return candidates.filter((_candidate, i) => open[i]);
 }
 
 /** A task's hold reason from `fm-tasks-axi.sh show <id>`, or `""` when it has none. */
 async function holdReason(taskId: string): Promise<string> {
   const result = await run(bin("fm-tasks-axi.sh"), ["show", taskId], { timeoutMs: 30_000 });
-  const reason = /hold_reason: "?(.*?)"?$/m.exec(result.stdout)?.[1];
 
-  return reason && reason !== "-" ? reason : "";
+  return parseHoldReason(result.stdout);
 }
 
 /**
@@ -377,25 +393,8 @@ async function holdReason(taskId: string): Promise<string> {
  * of it is still there.
  */
 function killGroup(child: ChildProcess): void {
-  const pid = child.pid;
-
-  if (pid === undefined) {
-    return;
-  }
-
-  /** Signal the group. False when it is already gone. */
-  const signalGroup = (signal: NodeJS.Signals): boolean => {
-    try {
-      process.kill(-pid, signal);
-
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  if (signalGroup("SIGTERM")) {
-    setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS).unref();
+  if (signalGroup(child, "SIGTERM")) {
+    setTimeout(() => signalGroup(child, "SIGKILL"), KILL_GRACE_MS).unref();
   }
 }
 
@@ -523,6 +522,23 @@ function prNumber(url: string): number | null {
 }
 
 /**
+ * Whether a pull request is still open, according to `gh pr view`.
+ *
+ * @remarks
+ * Only a clear answer other than `OPEN` (such as `MERGED` or `CLOSED`) counts as not open. When
+ * `gh` fails, for example because it is missing or not signed in, the pull request counts as
+ * open, so it is not hidden just because GitHub could not be asked.
+ */
+async function prStillOpen(url: string): Promise<boolean> {
+  const result = await run(GH, ["pr", "view", url, "--json", "state", "--jq", ".state"], {
+    timeoutMs: 25_000,
+  });
+  const state = result.stdout.trim();
+
+  return result.code !== 0 || state === "" || state === "OPEN";
+}
+
+/**
  * Read `state/<id>.meta`, a file of `key=value` lines, and keep the keys this API reads.
  *
  * @returns The keys and values (see {@link TaskMetaSchema}), or an empty object when the task
@@ -546,6 +562,30 @@ async function readMeta(taskId: string): Promise<TaskMeta> {
   }
 
   return TaskMetaSchema.parse(pairs);
+}
+
+/**
+ * Read the end of a file: at most `maxBytes`, starting at a line boundary.
+ *
+ * @param filePath - The file to read.
+ * @param maxBytes - The most bytes to read from the end.
+ * @returns The text. When the file is longer than `maxBytes`, the first, probably cut, line is
+ *   left out.
+ */
+async function readTail(filePath: string, maxBytes: number): Promise<string> {
+  const handle = await open(filePath, "r");
+
+  try {
+    const { size } = await handle.stat();
+    const start = Math.max(0, size - maxBytes);
+    const buffer = Buffer.alloc(size - start);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+    const text = buffer.subarray(0, bytesRead).toString("utf8");
+
+    return start > 0 ? text.slice(text.indexOf("\n") + 1) : text;
+  } finally {
+    await handle.close();
+  }
 }
 
 /**
@@ -604,6 +644,8 @@ function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunRes
       stdio: [opts.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
 
+    liveChildren.add(child);
+
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let outputBytes = 0;
@@ -641,6 +683,7 @@ function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunRes
       }
       settled = true;
       clearTimeout(timer);
+      liveChildren.delete(child);
 
       const errorText = stripVTControlCharacters(Buffer.concat(stderr).toString("utf8"));
       const stopped = stoppedBecause ? `${path.basename(cmd)} ${stoppedBecause}.` : "";
@@ -663,6 +706,50 @@ function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunRes
       child.stdin?.end(opts.input);
     }
   });
+}
+
+/**
+ * Send a signal to a command's process group (see {@link run}).
+ *
+ * @returns False when the group is already gone.
+ */
+function signalGroup(child: ChildProcess, signal: NodeJS.Signals): boolean {
+  if (child.pid === undefined) {
+    return false;
+  }
+  try {
+    process.kill(-child.pid, signal);
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stop every running command, for a clean shutdown, and start no more rebuilds.
+ *
+ * @remarks
+ * Commands run in their own process groups, so they do not get the terminal's Ctrl-C and would
+ * outlive the server. Each group gets SIGTERM; any still running after {@link KILL_GRACE_MS}
+ * gets SIGKILL. This resolves once all have exited or been sent SIGKILL.
+ */
+export async function stopCommands(): Promise<void> {
+  stopping = true;
+  clearTimeout(timer);
+
+  for (const child of liveChildren) {
+    signalGroup(child, "SIGTERM");
+  }
+
+  const deadline = Date.now() + KILL_GRACE_MS;
+
+  while (liveChildren.size > 0 && Date.now() < deadline) {
+    await delay(100);
+  }
+  for (const child of liveChildren) {
+    signalGroup(child, "SIGKILL");
+  }
 }
 
 /**
@@ -785,10 +872,11 @@ export function getBearings(): Bearings | null {
  * @remarks
  * Every rebuild that finishes, scheduled or manual, schedules the next one: a full interval
  * later after a success, or {@link RETRY_SECONDS} later after a failure. A failure keeps the
- * previous snapshot and records the error. This never rejects.
+ * previous snapshot and records the error. After {@link stopCommands}, nothing more is
+ * scheduled. This never rejects.
  */
 async function refresh(): Promise<void> {
-  if (refreshing) {
+  if (refreshing || stopping) {
     return;
   }
   refreshing = true;
@@ -801,8 +889,12 @@ async function refresh(): Promise<void> {
   } finally {
     refreshing = false;
     clearTimeout(timer);
+  }
 
+  // After stopCommands, the build above failed or was cut short; schedule nothing more.
+  if (!stopping) {
     const waitMs = (lastError ? RETRY_SECONDS : REFRESH_SECONDS) * 1000;
+
     nextMs = Date.now() + waitMs;
     timer = setTimeout(() => void refresh(), waitMs);
     // Don't keep the process alive just for the next rebuild.
@@ -842,12 +934,14 @@ export function status(): ServiceStatus {
  *
  * @param decisionId - The id of the task the decision gates.
  * @param request - The validated request body.
+ * @param requestId - The note's request id (see {@link sendNote}).
  * @returns `ok: true` once the note is recorded, or the reason nothing was sent.
  * @throws When the inbox script fails.
  */
 export async function sendAnswers(
   decisionId: string,
   request: AnswerRequest,
+  requestId?: string,
 ): Promise<AnswerOutcome> {
   const decision = getBearings()?.waitingOnYou.decisions.find((d) => d.id === decisionId);
 
@@ -884,6 +978,7 @@ export async function sendAnswers(
 
   await sendNote(
     `Reply from the Fleet Bearings API to the open question "${decision.title}" (task ${decision.id}):\n${lines.join("\n")}`,
+    requestId,
   );
 
   return { ok: true };
@@ -892,19 +987,28 @@ export async function sendAnswers(
 /**
  * Send a free-form note to Firstmate's inbox.
  *
+ * @param text - The note.
+ * @param requestId - The note's request id (see {@link sendNote}).
  * @throws When the inbox script fails.
  */
-export async function sendGeneralNote(text: string): Promise<void> {
-  await sendNote(`Reply from the Fleet Bearings API (general note):\n${text}`);
+export async function sendGeneralNote(text: string, requestId?: string): Promise<void> {
+  await sendNote(`Reply from the Fleet Bearings API (general note):\n${text}`, requestId);
 }
 
 /**
- * Pipe a note into `fm-inbox.sh note`, with a fresh request id so it is recorded once.
+ * Pipe a note into `fm-inbox.sh note --request-id <id>`.
  *
+ * @remarks
+ * `fm-inbox.sh` records a note once per request id. The id is the caller's `Idempotency-Key`
+ * when it sent one, so a retried request does not add the note twice, and a fresh UUID
+ * otherwise.
+ *
+ * @param body - The note.
+ * @param requestId - The request id, or `undefined` for a fresh one.
  * @throws When the inbox script exits with an error. The message is the script's output.
  */
-async function sendNote(body: string): Promise<void> {
-  const result = await run(bin("fm-inbox.sh"), ["note", "--request-id", randomUUID(), "-"], {
+async function sendNote(body: string, requestId: string = randomUUID()): Promise<void> {
+  const result = await run(bin("fm-inbox.sh"), ["note", "--request-id", requestId, "-"], {
     input: body,
     timeoutMs: 30_000,
   });

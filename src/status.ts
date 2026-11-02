@@ -12,13 +12,13 @@ import { stripVTControlCharacters } from "node:util";
 import type { z } from "zod";
 
 import { RawSnapshotSchema } from "./schemas.ts";
+import type { RawSnapshot } from "./schemas.ts";
 import { STEP_NAMES, STEP_STATUSES } from "./types.ts";
 import type {
   Finding,
   Pipeline,
   PipelineStep,
   QuestionOption,
-  RawSnapshot,
   StepName,
   StepStatus,
   TaskState,
@@ -275,6 +275,33 @@ export function friendly(line: string): { body: string; word: string } {
     .replace(/^[\s:·]+|[\s:·]+$/g, "");
 
   return { body: body.slice(0, 150), word };
+}
+
+/**
+ * Read a task's hold reason from the output of `fm-tasks-axi.sh show <id>`.
+ *
+ * @remarks
+ * The value is on a `hold_reason:` line, either bare or in double quotes. Inside quotes, `\"`
+ * and `\\` stand for a quote and a backslash, and `\n` for a line break. A `-` means none.
+ *
+ * @example
+ * ```ts
+ * parseHoldReason('hold_reason: "Pick \\"fast\\" or not"'); // => 'Pick "fast" or not'
+ * parseHoldReason("hold_reason: -"); // => ""
+ * ```
+ *
+ * @param output - The command's stdout.
+ * @returns The reason, or `""` when there is none.
+ */
+export function parseHoldReason(output: string): string {
+  const match = /hold_reason: (?:"((?:[^"\\]|\\.)*)"\s*$|(.*)$)/m.exec(output);
+  const quoted = match?.[1];
+  const reason =
+    quoted === undefined
+      ? (match?.[2] ?? "").trim()
+      : quoted.replace(/\\(.)/g, (_escape, char: string) => (char === "n" ? "\n" : char));
+
+  return reason === "-" ? "" : reason;
 }
 
 /**
