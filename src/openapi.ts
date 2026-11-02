@@ -8,6 +8,8 @@
  *
  * @packageDocumentation
  */
+import { REFRESH_SECONDS } from "./gather.ts";
+import { plural } from "./status.ts";
 import { ACTIVITY_LIMIT, STEP_NAMES, STEP_STATUSES, TASK_STATES } from "./types.ts";
 
 /** Any JSON value. */
@@ -36,6 +38,12 @@ const str = (description: string, extra: Schema = {}): Schema => ({
   ...extra,
 });
 
+/** The refresh interval in words, for example `5 minutes` or `90 seconds`. */
+const refreshInterval =
+  REFRESH_SECONDS % 60 === 0
+    ? plural(REFRESH_SECONDS / 60, "minute")
+    : plural(REFRESH_SECONDS, "second");
+
 /** A mutable copy of {@link STEP_NAMES}, since {@link Json} arrays are not readonly. */
 const stepNames = [...STEP_NAMES];
 
@@ -57,6 +65,7 @@ const schemas: Record<string, Schema> = {
     additionalProperties: false,
     properties: {
       answers: {
+        description: "Each question may be answered only once.",
         items: {
           additionalProperties: false,
           properties: {
@@ -484,6 +493,7 @@ const paths: Record<string, Record<string, Schema>> = {
         "415": errorResponse("Content-Type must be application/json."),
         "422": errorResponse("A question number does not exist in the decision."),
         "502": errorResponse("The note could not be recorded."),
+        "503": errorResponse("The first snapshot is still being built."),
       },
       summary: "Answer questions in a decision",
       tags: ["Questions"],
@@ -555,12 +565,13 @@ const paths: Record<string, Record<string, Schema>> = {
 };
 
 // Responses that many operations share, added here rather than repeated in each one:
-// 421 for every operation, 401 unless it is public (`security: []`), 403 for writes, and 413
-// for operations with a body.
+// 421 and 500 for every operation, 401 unless it is public (`security: []`), 403 for writes,
+// and 413 for operations with a body.
 for (const ops of Object.values(paths)) {
   for (const [method, op] of Object.entries(ops)) {
     const responses = op["responses"] as Record<string, Json>;
     responses["421"] = errorResponse("The Host header is not an allowed host name.");
+    responses["500"] = errorResponse("An unexpected error. The server log has the details.");
     if (op["security"] === undefined)
       responses["401"] = errorResponse(
         "An API key is set and the bearer token is missing or wrong.",
@@ -583,7 +594,7 @@ export const openapi: Schema = {
   info: {
     description:
       "A read API over the Fleet Bearings view: the questions waiting on the captain, the work under way with its validation steps, what landed, what is queued, and recent activity. " +
-      "Data is rebuilt every 5 minutes. A few write endpoints send answers and notes to Firstmate as inbox notes; the API never answers a decision, merges, or changes a task by itself.",
+      `Data is rebuilt every ${refreshInterval}. A few write endpoints send answers and notes to Firstmate as inbox notes; the API never answers a decision, merges, or changes a task by itself.`,
     summary: "What the fleet is doing, what needs you, and a way to answer.",
     title: "Fleet Bearings API",
     version: "1.0.0",

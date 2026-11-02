@@ -17,5 +17,5 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm lint
       - run: pnpm fmt:check
-      # The live API checks need a Firstmate home, so CI runs the spec and parser checks only.
-      - run: pnpm check --offline
+      # Starts the API against the fixed Firstmate home in fixtures/home and runs every check.
+      - run: pnpm check --fixture

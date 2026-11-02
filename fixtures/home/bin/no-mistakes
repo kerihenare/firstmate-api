@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fixture for `pnpm check --fixture`: `axi status` for a run part way through.
+cat <<'RUN'
+run:
+  id: "01FIXTURE"
+  status: running
+  steps[3]{step,status,findings,duration_ms}:
+    intent,completed,0,4
+    test,running,1,0
+    ci,pending,0,0
+RUN

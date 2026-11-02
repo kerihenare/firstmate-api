@@ -17,7 +17,7 @@ pnpm start         # http://localhost:4748
 - OpenAPI spec: <http://localhost:4748/openapi.json>
 - `start.sh` starts it in the background and is safe to run twice.
 
-Data is rebuilt every 5 minutes. `POST /api/v1/refresh` rebuilds it now.
+Data is rebuilt every 5 minutes by default (`BEARINGS_API_REFRESH`). `POST /api/v1/refresh` rebuilds it now.
 
 ## Endpoints
 
@@ -45,7 +45,7 @@ Writes (`POST`) that carry an `Origin` header from another site get a 403, so a 
 | `BEARINGS_API_HOST`          | `127.0.0.1`                 | Interface                                                                                                            |
 | `BEARINGS_API_KEY`           | none                        | When set, `/api/v1/*` needs `Authorization: Bearer <key>`                                                            |
 | `BEARINGS_API_ALLOWED_HOSTS` | `localhost,127.0.0.1,[::1]` | Host names it answers to                                                                                             |
-| `BEARINGS_API_REFRESH`       | `300`                       | Seconds between rebuilds                                                                                             |
+| `BEARINGS_API_REFRESH`       | `300`                       | Seconds between rebuilds, from 10 to 86400                                                                           |
 | `BEARINGS_LINEAR_BASE`       | none                        | Ticket link base, for example `https://linear.app/<workspace>/issue/`                                                |
 | `BEARINGS_LINEAR_TEAMS`      | none                        | Linear team keys to recognise, for example `LIV,ENG`. Tasks get a ticket link only when both Linear settings are set |
 
@@ -59,7 +59,11 @@ pnpm lint           # oxlint
 pnpm fmt:check      # oxfmt (pnpm fmt to fix)
 pnpm check          # validates the OpenAPI document and runs the parsers on samples, then calls the
                     # running API and checks every response against the schemas in the document
-pnpm check --offline  # spec and parser checks only; no server needed (this is what CI runs)
+pnpm check --offline  # spec and parser checks only; no server needed
+pnpm check --fixture  # starts its own server on the fixed Firstmate home in fixtures/home and
+                      # runs every check, plus the exact values that home should give (CI runs this)
 ```
+
+`fixtures/home` has stub `bin/` scripts (and a `no-mistakes` stub) that print fixed output. When you change what the API reads from Firstmate, update the stubs and the `fixture:` checks in `scripts/check.ts` to match.
 
 The spec is in `src/openapi.ts` and mirrors the types in `src/types.ts`.

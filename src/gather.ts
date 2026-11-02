@@ -9,18 +9,21 @@
  *
  * @packageDocumentation
  */
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 
+import { integerSetting } from "./env.ts";
 import {
   describeTask,
   firstSentence,
   parsePipeline,
   parseQuestions,
+  parseSnapshot,
   plural,
   readyForReview,
   slugFromRemote,
@@ -71,6 +74,9 @@ const EVENT_KIND: Record<string, ActivityEvent["kind"]> = {
   resolved: "decision_made",
 };
 
+/** How long a stopped command's process group gets to exit after SIGTERM, before SIGKILL. */
+const KILL_GRACE_MS = 5000;
+
 /** The base URL for ticket links, for example `https://linear.app/<workspace>/issue/`. */
 const LINEAR_BASE = process.env["BEARINGS_LINEAR_BASE"] ?? "";
 
@@ -86,8 +92,20 @@ const LINEAR_TEAMS = (process.env["BEARINGS_LINEAR_TEAMS"] ?? "")
   .map((team) => team.trim().toUpperCase())
   .filter((team) => /^[A-Z0-9]+$/.test(team));
 
-/** Seconds between scheduled rebuilds. */
-export const REFRESH_SECONDS = Number(process.env["BEARINGS_API_REFRESH"] ?? 300);
+/**
+ * The most output a command may print, in bytes, across stdout and stderr. Past this it is
+ * stopped.
+ */
+const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Seconds between scheduled rebuilds.
+ *
+ * @remarks
+ * At least 10, since every rebuild runs dozens of processes. A bad value stops the server at
+ * startup (see {@link integerSetting}).
+ */
+export const REFRESH_SECONDS = integerSetting("BEARINGS_API_REFRESH", 300, 10, 86_400);
 
 /** After a failed rebuild, retry this soon rather than waiting a full interval. */
 const RETRY_SECONDS = Math.min(30, REFRESH_SECONDS);
@@ -283,18 +301,6 @@ async function crewLine(taskId: string): Promise<string> {
 }
 
 /**
- * The exit code of a command run by `execFile`.
- *
- * @param error - The error `execFile` passed to its callback, or `null` on success.
- * @returns 0 on success, the process's exit code when it has one, and otherwise 1 (the command
- *   was not found, timed out, or was killed).
- */
-function exitCode(error: { code?: unknown } | null): number {
-  if (!error) return 0;
-  return typeof error.code === "number" ? error.code : 1;
-}
-
-/**
  * The pull requests waiting for the captain to merge.
  *
  * @remarks
@@ -328,6 +334,30 @@ async function holdReason(taskId: string): Promise<string> {
   const result = await run(bin("fm-tasks-axi.sh"), ["show", taskId], { timeoutMs: 30_000 });
   const reason = /hold_reason: "?(.*?)"?$/m.exec(result.stdout)?.[1];
   return reason && reason !== "-" ? reason : "";
+}
+
+/**
+ * Stop a command and everything it started.
+ *
+ * @remarks
+ * {@link run} starts each command in its own process group, so signalling the group also
+ * reaches the processes a script started (`git`, `gh`, ...). Signalling only the script would
+ * leave those running. The group gets SIGTERM, then SIGKILL after {@link KILL_GRACE_MS} if any
+ * of it is still there.
+ */
+function killGroup(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid === undefined) return;
+  /** Signal the group. False when it is already gone. */
+  const signalGroup = (signal: NodeJS.Signals): boolean => {
+    try {
+      process.kill(-pid, signal);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (signalGroup("SIGTERM")) setTimeout(() => signalGroup("SIGKILL"), KILL_GRACE_MS).unref();
 }
 
 /**
@@ -459,14 +489,15 @@ async function readMeta(taskId: string): Promise<Record<string, string>> {
 /**
  * Run `fm-bearings-snapshot.sh --json` and parse its output.
  *
- * @throws When the script fails, prints nothing, or prints something that is not JSON.
+ * @throws When the script fails or prints nothing, or its output is not the expected JSON
+ *   (see {@link parseSnapshot}).
  */
 async function readSnapshot(): Promise<RawSnapshot> {
   const result = await run(bin("fm-bearings-snapshot.sh"), ["--json"], { timeoutMs: 150_000 });
   if (result.code !== 0 || !result.stdout.trim()) {
     throw new Error((result.stderr || "snapshot failed").trim().slice(0, 300));
   }
-  return JSON.parse(result.stdout) as RawSnapshot;
+  return parseSnapshot(result.stdout);
 }
 
 /** The GitHub `owner/name` of a project's `origin` remote, or `""` when it is not on GitHub. */
@@ -487,29 +518,62 @@ async function repoSlug(projectDir: string): Promise<string> {
  *
  * @remarks
  * This never rejects: a failure is reported through {@link RunResult.code}. The command gets
- * `FM_HOME` and `NO_COLOR=1` in its environment, and its output is capped at 16 MB.
+ * `FM_HOME` and `NO_COLOR=1` in its environment. It runs in its own process group, so when it
+ * times out or prints more than {@link MAX_OUTPUT_BYTES}, {@link killGroup} stops it along with
+ * everything it started.
  */
 function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunResult> {
   return new Promise((resolve) => {
-    const child = execFile(
-      cmd,
-      args,
-      {
-        cwd: opts.cwd ?? FM_HOME,
-        env: { ...process.env, FM_HOME, NO_COLOR: "1" },
-        maxBuffer: 16 * 1024 * 1024,
-        timeout: opts.timeoutMs ?? 60_000,
-      },
-      (error, stdout, stderr) => {
-        // A missing binary or a timeout leaves stderr empty, so keep the error's reason instead.
-        const errorText = stripVTControlCharacters(String(stderr)) || (error ? error.message : "");
-        resolve({
-          code: exitCode(error),
-          stderr: errorText,
-          stdout: stripVTControlCharacters(String(stdout)),
-        });
-      },
-    );
+    const timeoutMs = opts.timeoutMs ?? 60_000;
+    const child = spawn(cmd, args, {
+      cwd: opts.cwd ?? FM_HOME,
+      detached: true,
+      env: { ...process.env, FM_HOME, NO_COLOR: "1" },
+      stdio: [opts.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    });
+
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let outputBytes = 0;
+    /** Why the command was stopped, or `""` while it has not been. */
+    let stoppedBecause = "";
+    let settled = false;
+
+    const stop = (reason: string): void => {
+      if (stoppedBecause) return;
+      stoppedBecause = reason;
+      killGroup(child);
+    };
+    const timer = setTimeout(() => stop(`timed out after ${timeoutMs / 1000}s`), timeoutMs);
+
+    const collect =
+      (into: Buffer[]) =>
+      (chunk: Buffer): void => {
+        outputBytes += chunk.length;
+        if (outputBytes > MAX_OUTPUT_BYTES) return stop("printed too much output");
+        into.push(chunk);
+      };
+    child.stdout?.on("data", collect(stdout));
+    child.stderr?.on("data", collect(stderr));
+
+    /** Resolve once, whichever of `error` and `close` comes first. */
+    const finish = (code: number, reason: string): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const errorText = stripVTControlCharacters(Buffer.concat(stderr).toString("utf8"));
+      const stopped = stoppedBecause ? `${path.basename(cmd)} ${stoppedBecause}.` : "";
+      resolve({
+        code: stoppedBecause ? 1 : code,
+        // A missing binary or a timeout leaves stderr empty, so give the reason instead.
+        stderr: [stopped, errorText || reason].filter(Boolean).join(" "),
+        stdout: stripVTControlCharacters(Buffer.concat(stdout).toString("utf8")),
+      });
+    };
+    // `error` is a command that could not start, such as a missing binary.
+    child.on("error", (error) => finish(1, error.message));
+    child.on("close", (code, signal) => finish(code ?? 1, signal ? `killed by ${signal}` : ""));
+
     if (opts.input !== undefined) {
       // EPIPE when the child exits before reading; the exit code already reports the failure.
       child.stdin?.on("error", () => {});
@@ -552,7 +616,7 @@ function toDecision(decision: RawDecision, reason: string): Decision {
       ? `${plural(questions.length, "question")} to answer. The recommended option is marked.`
       : "Needs your answer.",
     text: hasQuestions ? null : reason,
-    title: (decision.summary.split(":")[0] ?? decision.id).trim(),
+    title: decision.summary.split(":")[0]?.trim() || decision.id,
   };
 }
 
@@ -633,7 +697,7 @@ export function getBearings(): Bearings | null {
  * later after a success, or {@link RETRY_SECONDS} later after a failure. A failure keeps the
  * previous snapshot and records the error. This never rejects.
  */
-export async function refresh(): Promise<void> {
+async function refresh(): Promise<void> {
   if (refreshing) return;
   refreshing = true;
   try {
@@ -653,13 +717,14 @@ export async function refresh(): Promise<void> {
   }
 }
 
-/** Start a rebuild in the background and return at once. Used by `POST /api/v1/refresh`. */
-export async function requestRefresh(): Promise<void> {
-  void refresh();
-}
-
-/** Build the first snapshot in the background. Each rebuild then schedules the next. */
-export function startRefreshLoop(): void {
+/**
+ * Start a rebuild in the background and return at once.
+ *
+ * @remarks
+ * The server calls this at startup to build the first snapshot, after which each rebuild
+ * schedules the next, and for `POST /api/v1/refresh`.
+ */
+export function refreshInBackground(): void {
   void refresh();
 }
 
@@ -705,10 +770,12 @@ export async function sendAnswers(
   const lines: string[] = [];
   for (const { answer, question: number } of request.answers) {
     const question = decision.questions.find((q) => q.number === number);
+    // One line per answer, so an answer cannot add lines that look like part of the note.
+    const oneLine = answer.replace(/\s+/g, " ");
     if (question) {
-      lines.push(`${question.number}. ${question.title} → ${answer}`);
+      lines.push(`${question.number}. ${question.title} → ${oneLine}`);
     } else if (isFreeText && number === 1) {
-      lines.push(answer);
+      lines.push(oneLine);
     } else {
       return {
         code: "unknown_question",

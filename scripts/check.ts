@@ -3,15 +3,26 @@
  * then calls the running API and validates every response against the schemas in that document.
  *
  * @remarks
- * Usage: `node scripts/check.ts [baseUrl] [--offline]`. The base URL defaults to
+ * Usage: `node scripts/check.ts [baseUrl] [--offline | --fixture]`. The base URL defaults to
  * `http://127.0.0.1:4748`.
  *
  * `--offline` stops after the spec and parser checks, so it needs no server or Firstmate home.
- * Set `BEARINGS_API_KEY` to the server's key when it has one; the 401 case is then checked too.
- * The process exits with 1 when any check fails.
+ *
+ * `--fixture` starts its own server on a free port, reading the fixed Firstmate home in
+ * `fixtures/home` (stub scripts, plus a `no-mistakes` stub put on its `PATH`), with an API key
+ * and Linear settings. It then runs every check, plus checks of the exact values that home
+ * should produce. This is what CI runs.
+ *
+ * Otherwise, set `BEARINGS_API_KEY` to the server's key when it has one; the 401 case is then
+ * checked too. The process exits with 1 when any check fails.
  *
  * @packageDocumentation
  */
+import { spawn } from "node:child_process";
+import { createServer } from "node:net";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import SwaggerParser from "@apidevtools/swagger-parser";
 import addFormatsImport from "ajv-formats";
 import { Ajv2020 } from "ajv/dist/2020.js";
@@ -21,10 +32,12 @@ import {
   describeTask,
   parsePipeline,
   parseQuestions,
+  parseSnapshot,
   slugFromRemote,
   splitRow,
   ticketKey,
 } from "../src/status.ts";
+import type { Bearings } from "../src/types.ts";
 
 /** Options for {@link call}. */
 interface CallOptions {
@@ -47,10 +60,21 @@ interface CallResult {
 /** Checks a value against a schema, returning what is wrong with it or `null` when it is valid. */
 type Validator = (value: unknown) => string | null;
 
+/** The API key the fixture server is started with, so the fixture run checks the 401 case. */
+const FIXTURE_KEY = "fixture-key";
+
 const args = process.argv.slice(2);
-const base = args.find((arg) => !arg.startsWith("--")) ?? "http://127.0.0.1:4748";
-const key = process.env["BEARINGS_API_KEY"] ?? "";
+const fixture = args.includes("--fixture");
+const key = fixture ? FIXTURE_KEY : (process.env["BEARINGS_API_KEY"] ?? "");
 const offline = args.includes("--offline");
+/** The API under test. Replaced by the fixture server's address under `--fixture`. */
+let base = args.find((arg) => !arg.startsWith("--")) ?? "http://127.0.0.1:4748";
+
+/**
+ * How long to wait for the first snapshot. The snapshot script alone may take 150 s, and the
+ * per-task lookups come after it, so this allows a slow home plenty of room.
+ */
+const READY_TIMEOUT_MS = 300_000;
 
 /** How many checks have failed so far. */
 let failures = 0;
@@ -95,6 +119,45 @@ async function call(method: string, path: string, options: CallOptions = {}): Pr
   return { json, status: response.status };
 }
 
+/** A TCP port that is free right now, found by letting the system pick one. */
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createServer();
+    probe.on("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
+/**
+ * Start the API against `fixtures/home` on a free port. It is stopped when this script exits.
+ *
+ * @returns The server's base URL.
+ */
+async function startFixtureServer(): Promise<string> {
+  const port = await freePort();
+  const repo = fileURLToPath(new URL("..", import.meta.url));
+  const home = path.join(repo, "fixtures", "home");
+  const server = spawn(process.execPath, [path.join(repo, "src", "server.ts")], {
+    env: {
+      ...process.env,
+      BEARINGS_API_KEY: FIXTURE_KEY,
+      BEARINGS_API_PORT: String(port),
+      BEARINGS_LINEAR_BASE: "https://linear.example/issue/",
+      BEARINGS_LINEAR_TEAMS: "LIV",
+      FM_HOME: home,
+      // The fixture's `no-mistakes` stub comes first.
+      PATH: `${path.join(home, "bin")}${path.delimiter}${process.env["PATH"] ?? ""}`,
+    },
+    stdio: ["ignore", "ignore", "inherit"],
+  });
+  process.on("exit", () => server.kill());
+  return `http://127.0.0.1:${port}`;
+}
+
 /**
  * Check a response's status and, when a validator is given, its body.
  *
@@ -128,6 +191,62 @@ function validator(name: string, array = false): Validator {
     }
     return null;
   };
+}
+
+/**
+ * Check that the snapshot built from `fixtures/home` has the values that home should produce.
+ *
+ * @remarks
+ * The schema checks only show the shapes are right. This shows the gathering is: the pipeline
+ * is read, the Linear key is found, hold reasons become questions, and so on.
+ */
+function checkFixtureValues(bearings: Bearings): void {
+  const ship = bearings.underway.find((task) => task.id === "ship-1");
+  expectEqual(
+    "fixture: tasks under way",
+    bearings.underway.map((task) => [task.id, task.kind, task.state]),
+    [
+      ["ship-1", "ship", "working"],
+      ["scout-1", "scout", "waiting"],
+    ],
+  );
+  expectEqual(
+    "fixture: pipeline and Linear link",
+    [ship?.status, ship?.pipeline?.runId, ship?.links.linear],
+    [
+      "Running the tests, 1 of 3 steps done.",
+      "01FIXTURE",
+      { key: "LIV-42", url: "https://linear.example/issue/LIV-42" },
+    ],
+  );
+  expectEqual(
+    "fixture: decisions",
+    bearings.waitingOnYou.decisions.map((decision) => [
+      decision.id,
+      decision.title,
+      decision.questions.map((question) => question.title),
+      decision.text,
+    ]),
+    [
+      ["scout-1", "Engine choice", ["Engine", "Flag"], null],
+      ["free-1", "Old flag", [], "Should the old flag stay for one more release?"],
+    ],
+  );
+  expectEqual(
+    "fixture: ready to merge, landed and queued",
+    [
+      bearings.waitingOnYou.readyToMerge.map((pr) => [pr.taskId, pr.pullRequest.number]),
+      bearings.recentlyLanded.map((item) => item.kind),
+      bearings.queued.map((item) => item.id),
+      bearings.counts,
+    ],
+    [
+      [["done-1", 7]],
+      ["pull_request", "report"],
+      ["queued-1"],
+      { landed: 2, queued: 1, underway: 2, waitingOnYou: 3 },
+    ],
+  );
 }
 
 // ---------- parsers, against fixed samples ----------
@@ -222,17 +341,80 @@ expectEqual(
   ["LIV-42", "", ""],
 );
 
+expectEqual(
+  "describeTask treats queued work as waiting",
+  describeTask("state: queued · source: gate", null, false).state,
+  "waiting",
+);
+const doneRun = parsePipeline(
+  [
+    "run:",
+    "  id: R3",
+    "  status: completed",
+    "  steps[2]{step,status}:",
+    "    intent,completed",
+    "    ci,skipped",
+  ].join("\n"),
+);
+expectEqual("describeTask calls a fully done run finished", describeTask("", doneRun, false), {
+  sentence: "All validation steps are done.",
+  state: "finished",
+});
+
+/** The error `parseSnapshot` throws for some text, or `""` when it accepts it. */
+const snapshotError = (text: string): string => {
+  try {
+    parseSnapshot(text);
+    return "";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+};
+const goodSnapshot = {
+  contributions: { checked: 1, complete: true, known: 1 },
+  decisions_open: [{ id: "d", summary: "Pick: one" }],
+  gates: [{ id: "g" }],
+  in_flight: [{ doing: "x", id: "t", kind: "ship", name: "T", repo: "r", state: "working" }],
+  landed: [],
+  recorded_prs: [],
+};
+expectEqual(
+  "parseSnapshot accepts a good snapshot and names what is wrong with bad ones",
+  [
+    snapshotError(JSON.stringify(goodSnapshot)),
+    snapshotError("not json"),
+    snapshotError(JSON.stringify({ ...goodSnapshot, landed: undefined })),
+    snapshotError(JSON.stringify({ ...goodSnapshot, in_flight: [{ id: "t" }] })),
+    snapshotError(JSON.stringify({ ...goodSnapshot, gates: [{ reason: 3 }] })),
+    snapshotError(JSON.stringify({ ...goodSnapshot, contributions: {} })),
+  ],
+  [
+    "",
+    "The snapshot script printed something that is not JSON.",
+    'The snapshot has no "landed" list.',
+    'The snapshot\'s in_flight[0] has no "doing" text.',
+    'The snapshot\'s gates[0] has a "reason" that is not text.',
+    'The snapshot\'s "contributions" needs checked, complete and known.',
+  ],
+);
+
 if (offline) {
   console.log(failures === 0 ? "\nAll offline checks passed." : `\n${failures} check(s) failed.`);
   process.exit(failures === 0 ? 0 : 1);
 }
 
 // ---------- live API: wait for the first snapshot ----------
+if (fixture) base = await startFixtureServer();
 let ready = false;
-for (let i = 0; i < 40 && !ready; i++) {
-  const h = await call("GET", "/health");
-  ready = (h.json as { ready?: boolean } | null)?.ready === true;
-  if (!ready) await new Promise((r) => setTimeout(r, 3000));
+const readyDeadline = Date.now() + READY_TIMEOUT_MS;
+while (!ready && Date.now() < readyDeadline) {
+  try {
+    const health = await call("GET", "/health");
+    ready = (health.json as { ready?: boolean } | null)?.ready === true;
+  } catch {
+    // Not listening yet.
+  }
+  if (!ready) await new Promise((resolve) => setTimeout(resolve, 3000));
 }
 if (!ready) {
   fail("API never became ready");
@@ -242,6 +424,7 @@ if (!ready) {
 const bearings = await call("GET", "/api/v1/bearings");
 expect("GET /api/v1/bearings", bearings, 200, validator("Bearings"));
 expect("GET /health", await call("GET", "/health"), 200, validator("Health"));
+if (fixture) checkFixtureValues(bearings.json as Bearings);
 expect("GET /api/v1/tasks", await call("GET", "/api/v1/tasks"), 200, validator("Task", true));
 expect(
   "GET /api/v1/tasks?state=working",
@@ -289,6 +472,7 @@ expect(
   validator("Error"),
 );
 expect("GET unknown path", await call("GET", "/api/v1/nothing"), 404, validator("Error"));
+expect("HEAD /api/v1/bearings", await call("HEAD", "/api/v1/bearings"), 200);
 
 const first = (bearings.json as { underway: { id: string }[] }).underway[0];
 if (first)
@@ -325,6 +509,20 @@ expect(
     type: "application/json",
   }),
   404,
+  validator("Error"),
+);
+expect(
+  "POST answers the same question twice",
+  await call("POST", "/api/v1/questions/x/answers", {
+    body: JSON.stringify({
+      answers: [
+        { answer: "a", question: 1 },
+        { answer: "b", question: 1 },
+      ],
+    }),
+    type: "application/json",
+  }),
+  400,
   validator("Error"),
 );
 expect(

@@ -15,6 +15,7 @@ import type {
   Pipeline,
   PipelineStep,
   QuestionOption,
+  RawSnapshot,
   StepName,
   StepStatus,
   TaskState,
@@ -25,6 +26,18 @@ const MAX_OPTIONS = 4;
 
 /** The longest sentence, in characters, that {@link describeTask} writes from a crew line. */
 const SENTENCE_MAX = 110;
+
+/**
+ * The lists in the snapshot script's JSON, with the text fields each item must have and the
+ * ones it may have. Only the fields this API reads are listed.
+ */
+const SNAPSHOT_LISTS: Record<string, { optional: string[]; required: string[] }> = {
+  decisions_open: { optional: [], required: ["id", "summary"] },
+  gates: { optional: ["id", "reason", "title"], required: [] },
+  in_flight: { optional: [], required: ["doing", "id", "kind", "name", "repo"] },
+  landed: { optional: [], required: ["artifact", "id", "what"] },
+  recorded_prs: { optional: [], required: ["id", "url"] },
+};
 
 /** The display word for each `state:` value a crew line can start with. */
 const STATE_WORD: Record<string, string> = {
@@ -72,6 +85,33 @@ export interface TaskDescription {
   state: TaskState;
 }
 
+/**
+ * Check one item of a snapshot list.
+ *
+ * @param item - The item.
+ * @param where - Where it is, for the error, for example `in_flight[2]`.
+ * @param fields - The text fields it must and may have.
+ * @throws When the item is not an object, a required field is not text, or an optional field
+ *   is present but not text.
+ */
+function checkSnapshotItem(
+  item: unknown,
+  where: string,
+  fields: { optional: string[]; required: string[] },
+): void {
+  if (!isRecord(item)) throw new Error(`The snapshot's ${where} is not an object.`);
+  for (const field of fields.required) {
+    if (typeof item[field] !== "string") {
+      throw new Error(`The snapshot's ${where} has no "${field}" text.`);
+    }
+  }
+  for (const field of fields.optional) {
+    if (item[field] !== undefined && item[field] !== null && typeof item[field] !== "string") {
+      throw new Error(`The snapshot's ${where} has a "${field}" that is not text.`);
+    }
+  }
+}
+
 /** Describe a task from its crew line alone, for tasks with no informative pipeline. */
 function describeCrewLine(crewLine: string): TaskDescription {
   const { body, word } = friendly(crewLine);
@@ -102,6 +142,7 @@ function describeCrewLine(crewLine: string): TaskDescription {
     case "Finished":
       return { sentence: summary || "Finished.", state: "finished" };
     case "Paused":
+    case "Queued":
     case "Waiting":
       return { sentence: summary || "Waiting.", state: "waiting" };
     case "Working":
@@ -150,7 +191,7 @@ function describePipeline(pipeline: Pipeline): TaskDescription | null {
     };
   }
   if (doneCount === steps.length) {
-    return { sentence: "All validation steps are done.", state: "working" };
+    return { sentence: "All validation steps are done.", state: "finished" };
   }
   return null;
 }
@@ -246,6 +287,11 @@ export function friendly(line: string): { body: string; word: string } {
     .replace(/\s+/g, " ")
     .replace(/^[\s:·]+|[\s:·]+$/g, "");
   return { body: body.slice(0, 150), word };
+}
+
+/** Whether a value is a plain object (not `null` and not an array). */
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -374,6 +420,45 @@ export function parseQuestions(reason: string): ParsedQuestion[] {
     }
   }
   return questions;
+}
+
+/**
+ * Parse and check the JSON printed by `fm-bearings-snapshot.sh --json`.
+ *
+ * @remarks
+ * Only the fields this API reads are checked (see {@link SNAPSHOT_LISTS}), so the script may
+ * add fields freely. The point is a clear error naming what is missing, rather than a
+ * `TypeError` from deep inside the snapshot build.
+ *
+ * @param text - The script's stdout.
+ * @returns The snapshot.
+ * @throws When the text is not JSON, or a list, item or field is missing or the wrong type.
+ */
+export function parseSnapshot(text: string): RawSnapshot {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new Error("The snapshot script printed something that is not JSON.");
+  }
+  if (!isRecord(value)) throw new Error("The snapshot is not a JSON object.");
+
+  for (const [list, fields] of Object.entries(SNAPSHOT_LISTS)) {
+    const items = value[list];
+    if (!Array.isArray(items)) throw new Error(`The snapshot has no "${list}" list.`);
+    items.forEach((item: unknown, index) => checkSnapshotItem(item, `${list}[${index}]`, fields));
+  }
+
+  const { contributions } = value;
+  if (
+    !isRecord(contributions) ||
+    typeof contributions["checked"] !== "number" ||
+    typeof contributions["complete"] !== "boolean" ||
+    typeof contributions["known"] !== "number"
+  ) {
+    throw new Error('The snapshot\'s "contributions" needs checked, complete and known.');
+  }
+  return value as unknown as RawSnapshot;
 }
 
 /**

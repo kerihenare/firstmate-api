@@ -16,16 +16,17 @@ import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
+import { integerSetting } from "./env.ts";
 import {
   getBearings,
-  requestRefresh,
+  refreshInBackground,
   sendAnswers,
   sendGeneralNote,
-  startRefreshLoop,
   status,
 } from "./gather.ts";
 import type { AnswerOutcome } from "./gather.ts";
 import { openapi } from "./openapi.ts";
+import { isRecord } from "./status.ts";
 import { ACTIVITY_LIMIT, TASK_STATES } from "./types.ts";
 import type {
   AnswerRequest,
@@ -74,7 +75,7 @@ const HOST = process.env["BEARINGS_API_HOST"] ?? "127.0.0.1";
 const MAX_BODY_BYTES = 20_000;
 
 /** The port to listen on. */
-const PORT = Number(process.env["BEARINGS_API_PORT"] ?? 4748);
+const PORT = integerSetting("BEARINGS_API_PORT", 4748, 1, 65_535);
 
 /** `/api/v1/tasks/{id}`. The id is captured. */
 const TASK_ROUTE = /^\/api\/v1\/tasks\/([A-Za-z0-9._-]+)$/;
@@ -103,7 +104,8 @@ type JsonBody =
  *
  * @remarks
  * Unknown keys are refused at both levels. There must be 1 to 20 answers, each with a whole
- * question number of at least 1 and a non-blank answer of at most 2000 characters.
+ * question number of at least 1 and a non-blank answer of at most 2000 characters. Each
+ * question may be answered only once.
  *
  * @returns The request with each answer trimmed, or `null` when the body is the wrong shape.
  */
@@ -113,11 +115,14 @@ function asAnswerRequest(value: unknown): AnswerRequest | null {
   if (!Array.isArray(list) || list.length < 1 || list.length > 20) return null;
 
   const answers: AnswerRequest["answers"] = [];
+  const seen = new Set<number>();
   for (const item of list as unknown[]) {
     if (!isRecord(item) || !hasOnlyKeys(item, ["answer", "question"])) return null;
     const { answer, question } = item;
     if (typeof question !== "number" || !Number.isInteger(question) || question < 1) return null;
     if (typeof answer !== "string" || answer.trim().length < 1 || answer.length > 2000) return null;
+    if (seen.has(question)) return null;
+    seen.add(question);
     answers.push({ answer: answer.trim(), question });
   }
   return { answers };
@@ -139,11 +144,6 @@ function asNoteRequest(value: unknown): NoteRequest | null {
 /** Whether every key of `record` is one of `allowed`. Missing keys are fine. */
 function hasOnlyKeys(record: Record<string, unknown>, allowed: string[]): boolean {
   return Object.keys(record).every((key) => allowed.includes(key));
-}
-
-/** Whether a value is a plain object (not `null` and not an array). */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -305,17 +305,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // Trailing slashes are ignored, so /api/v1/tasks/ is /api/v1/tasks.
   const route = url.pathname.replace(/\/+$/, "") || "/";
   const method = req.method ?? "GET";
+  // HEAD is routed like GET; Node leaves the body out of HEAD responses by itself.
   const isRead = method === "GET" || method === "HEAD";
   if (!isRead && !originOk(req)) {
     return fail(res, 403, "bad_origin", "Writes from other sites are not allowed.");
   }
 
   // Public: the spec, the docs page and health never need the key.
-  if (method === "GET" && route === "/openapi.json") return send(res, 200, openapi);
-  if (method === "GET" && (route === "/docs" || route === "/")) {
+  if (isRead && route === "/openapi.json") return send(res, 200, openapi);
+  if (isRead && (route === "/docs" || route === "/")) {
     return send(res, 200, DOCS, "text/html; charset=utf-8");
   }
-  if (method === "GET" && route === "/health") {
+  if (isRead && route === "/health") {
     const health = status();
     // The error text can name local paths, so only callers with the key see it.
     const error = health.error && !keyOk(req) ? "refresh failed" : health.error;
@@ -324,7 +325,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
   if (!keyOk(req)) return fail(res, 401, "unauthorized", "Send the API key as a bearer token.");
 
-  if (method === "GET") {
+  if (isRead) {
     if (route === "/api/v1/bearings") {
       const bearings = needBearings(res);
       return bearings ? send(res, 200, bearings) : undefined;
@@ -388,11 +389,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (method === "POST") {
     const answersFor = ANSWERS_ROUTE.exec(route)?.[1];
     if (answersFor) {
+      // Answers are checked against the open decisions, so there must be a snapshot.
+      if (!needBearings(res)) return;
       const body = await readJson(req);
       if (!body.ok) return fail(res, body.status, body.code, body.message);
       const request = asAnswerRequest(body.value);
       if (!request) {
-        const expected = 'Expected {"answers":[{"question":1,"answer":"..."}]}.';
+        const expected =
+          'Expected {"answers":[{"question":1,"answer":"..."}]}, with each question answered once.';
         return fail(res, 400, "invalid_body", expected);
       }
       return deliver(res, () => sendAnswers(answersFor, request));
@@ -410,7 +414,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     }
 
     if (route === "/api/v1/refresh") {
-      await requestRefresh();
+      refreshInBackground();
       const receipt: RefreshReceipt = { accepted: true };
       return send(res, 202, receipt);
     }
@@ -422,12 +426,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 // ---------- start ----------
 
 const server = createServer((req, res) => {
-  handle(req, res).catch(() => {
+  handle(req, res).catch((error: unknown) => {
+    console.error(`${req.method ?? "?"} ${req.url ?? "?"} failed:`, error);
     if (!res.headersSent) fail(res, 500, "internal_error", "Something went wrong.");
   });
 });
 
-startRefreshLoop();
+refreshInBackground();
 server.listen(PORT, HOST, () => {
   console.log(`bearings-api on http://localhost:${PORT}/  (docs: /docs, spec: /openapi.json)`);
 });
