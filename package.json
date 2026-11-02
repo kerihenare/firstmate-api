@@ -1,0 +1,19 @@
+{
+  "name": "fleet-bearings-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "JSON API for the Fleet Bearings view, described by an OpenAPI 3.1 spec.",
+  "scripts": {
+    "start": "node src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "node scripts/check.ts"
+  },
+  "devDependencies": {
+    "@apidevtools/swagger-parser": "^13.1.0",
+    "@types/node": "^26.6.6",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "typescript": "^7.0.2"
+  }
+}
