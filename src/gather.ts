@@ -1,15 +1,18 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
+
 import {
   describeTask,
   firstSentence,
   parsePipeline,
   parseQuestions,
   readyForReview,
+  slugFromRemote,
+  ticketKey,
 } from "./status.ts";
 import type {
   ActivityEvent,
@@ -25,83 +28,187 @@ import type {
   TaskLinks,
 } from "./types.ts";
 
+// HERE comes first because FM_HOME is built from it.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const FM_HOME = process.env["FM_HOME"] ?? path.resolve(HERE, "..", "..", "..");
-export const REFRESH_SECONDS = Number(process.env["BEARINGS_API_REFRESH"] ?? 300);
-/** Base URL for ticket links, for example https://linear.app/<workspace>/issue/. Without it, tasks carry no ticket link. */
+const KIND_LABEL: Record<string, ActivityEvent["kind"]> = {
+  blocked: "blocked",
+  done: "finished",
+  "needs-decision": "decision_asked",
+  resolved: "decision_made",
+};
+/** Base URL for ticket links, for example https://linear.app/<workspace>/issue/. */
 const LINEAR_BASE = process.env["BEARINGS_LINEAR_BASE"] ?? "";
+/** Linear team keys to recognise, for example LIV,ENG. Tasks get a ticket link only when this and LINEAR_BASE are set. */
+const LINEAR_TEAMS = (process.env["BEARINGS_LINEAR_TEAMS"] ?? "")
+  .split(",")
+  .map((t) => t.trim().toUpperCase())
+  .filter((t) => /^[A-Z0-9]+$/.test(t));
+export const REFRESH_SECONDS = Number(process.env["BEARINGS_API_REFRESH"] ?? 300);
+/** After a failed rebuild, retry this soon rather than waiting a full interval. */
+const RETRY_SECONDS = Math.min(30, REFRESH_SECONDS);
+/**
+ * Each task spawns up to five processes (crew, no-mistakes, git, gh, fm-tasks), and hold reasons
+ * run alongside with the same limit, so a refresh peaks at about 6 × TASK_CONCURRENCY processes.
+ */
+const TASK_CONCURRENCY = 4;
+
+const repoCache = new Map<string, string>();
 
 interface RunResult {
   code: number;
-  stdout: string;
   stderr: string;
+  stdout: string;
 }
 
-function run(
-  cmd: string,
-  args: string[],
-  opts: { cwd?: string; timeoutMs?: number; input?: string } = {},
-): Promise<RunResult> {
-  return new Promise((resolve) => {
-    const child = execFile(
-      cmd,
-      args,
-      {
-        cwd: opts.cwd ?? FM_HOME,
-        env: { ...process.env, FM_HOME, NO_COLOR: "1" },
-        timeout: opts.timeoutMs ?? 60_000,
-        maxBuffer: 16 * 1024 * 1024,
-      },
-      (error, stdout, stderr) => {
-        const code =
-          error && typeof (error as { code?: unknown }).code === "number"
-            ? (error as { code: number }).code
-            : error
-              ? 1
-              : 0;
-        resolve({
-          code,
-          stdout: stripVTControlCharacters(String(stdout)),
-          stderr: stripVTControlCharacters(String(stderr)),
+interface TaskInfo {
+  crew: string;
+  links: TaskLinks | null;
+  pipeline: Pipeline | null;
+}
+
+async function activityFeed(names: Map<string, string>, limit = 16): Promise<ActivityEvent[]> {
+  const events: ActivityEvent[] = [];
+  const now = Date.now();
+  let files: string[] = [];
+  try {
+    files = (await readdir(path.join(FM_HOME, "state"))).filter((f) => f.endsWith(".status"));
+  } catch {
+    return [];
+  }
+  for (const f of files) {
+    const p = path.join(FM_HOME, "state", f);
+    try {
+      if (now - (await stat(p)).mtimeMs > 86_400_000) continue;
+      const lines = (await readFile(p, "utf8")).split("\n").slice(-80);
+      const taskId = f.slice(0, -7);
+      for (const line of lines) {
+        const m = /^([\w-]+)((?: \[[^\]]+\])*):\s*(.*)$/.exec(line);
+        const kind = m && m[1] ? KIND_LABEL[m[1]] : undefined;
+        const at = m && m[2] ? /\[at=(\d+)\]/.exec(m[2])?.[1] : undefined;
+        if (!m || !kind || !at) continue;
+        events.push({
+          at: new Date(Number(at) * 1000).toISOString(),
+          kind,
+          taskId,
+          taskName: names.get(taskId) ?? taskId.replace(/-/g, " "),
+          text: firstSentence(m[3] ?? "", 150),
         });
-      },
-    );
-    if (opts.input !== undefined) {
-      // EPIPE when the child exits before reading; the exit code already reports the failure.
-      child.stdin?.on("error", () => {});
-      child.stdin?.end(opts.input);
+      }
+    } catch {
+      /* skip unreadable status */
     }
-  });
+  }
+  events.sort((a, b) => b.at.localeCompare(a.at));
+  return events.slice(0, limit);
 }
 
-const bin = (name: string): string => path.join(FM_HOME, "bin", name);
-
-async function readMeta(taskId: string): Promise<Record<string, string>> {
-  const meta: Record<string, string> = {};
-  try {
-    const text = await readFile(path.join(FM_HOME, "state", `${taskId}.meta`), "utf8");
-    for (const line of text.split("\n")) {
-      const i = line.indexOf("=");
-      if (i > 0) meta[line.slice(0, i)] = line.slice(i + 1);
-    }
-  } catch {
-    /* no record */
-  }
-  return meta;
+function bin(name: string): string {
+  return path.join(FM_HOME, "bin", name);
 }
 
-async function pipelineFor(meta: Record<string, string>): Promise<Pipeline | null> {
-  if (meta["mode"] !== "no-mistakes" || !meta["worktree"]) return null;
-  try {
-    await stat(meta["worktree"]);
-  } catch {
-    return null;
-  }
-  const r = await run("no-mistakes", ["axi", "status"], {
-    cwd: meta["worktree"],
-    timeoutMs: 40_000,
+async function build(): Promise<Bearings> {
+  const snap = await run(bin("fm-bearings-snapshot.sh"), ["--json"], { timeoutMs: 150_000 });
+  if (snap.code !== 0 || !snap.stdout.trim())
+    throw new Error((snap.stderr || "snapshot failed").trim().slice(0, 300));
+  const raw = JSON.parse(snap.stdout) as RawSnapshot;
+  const recordedPr = new Map(raw.recorded_prs.map((p) => [p.id, p.url]));
+  const names = new Map(raw.in_flight.map((t) => [t.id, t.name]));
+
+  const ids = [...new Set([...names.keys(), ...raw.recorded_prs.map((p) => p.id)])];
+  const [infoList, holdList, activity] = await Promise.all([
+    mapLimit(ids, TASK_CONCURRENCY, (id) => taskInfo(id, names.get(id), recordedPr.get(id) ?? "")),
+    mapLimit(raw.decisions_open, TASK_CONCURRENCY, (d) => holdReason(d.id)),
+    activityFeed(names),
+  ]);
+  const info = new Map(ids.map((id, i) => [id, infoList[i]]));
+  const holds = new Map(raw.decisions_open.map((d, i) => [d.id, holdList[i] ?? ""]));
+
+  const underway: Task[] = raw.in_flight.map((t) => {
+    const i = info.get(t.id);
+    const line = i?.crew || t.doing;
+    const pipeline = i?.pipeline ?? null;
+    const { state, sentence } = describeTask(line, pipeline, readyForReview(line));
+    return {
+      id: t.id,
+      kind: taskKind(t.kind),
+      links: i?.links ?? { linear: null, pullRequest: null },
+      name: t.name,
+      pipeline,
+      repo: t.repo,
+      state,
+      status: sentence,
+    };
   });
-  return r.stdout ? parsePipeline(r.stdout) : null;
+
+  const decisions: Decision[] = raw.decisions_open.map((d) => {
+    const title = (d.summary.split(":")[0] ?? d.id).trim();
+    const reason = holds.get(d.id) || d.summary;
+    const qs = parseQuestions(reason);
+    return {
+      id: d.id,
+      questions: qs.map((q, i) => ({ number: i + 1, options: q.options, title: q.title })),
+      summary:
+        qs.length > 0
+          ? `${qs.length} question${qs.length === 1 ? "" : "s"} to answer. The recommended option is marked.`
+          : "Needs your answer.",
+      text: qs.length > 0 ? null : reason,
+      title,
+    };
+  });
+
+  const landedUrls = new Set(raw.landed.map((l) => l.artifact));
+  const readyToMerge: ReadyToMerge[] = [];
+  for (const p of raw.recorded_prs) {
+    if (landedUrls.has(p.url) || !readyForReview(info.get(p.id)?.crew ?? "")) continue;
+    const number = prNumber(p.url);
+    if (number === null) continue;
+    readyToMerge.push({
+      name: names.get(p.id) ?? p.id,
+      pullRequest: { number, url: p.url },
+      summary: "Ready for you to review and merge.",
+      taskId: p.id,
+    });
+  }
+
+  const landed: LandedItem[] = raw.landed.map((l) => {
+    const isUrl = l.artifact.startsWith("http");
+    return {
+      id: l.id,
+      kind: isUrl ? "pull_request" : "report",
+      path: isUrl ? null : l.artifact,
+      title: l.what,
+      url: isUrl ? l.artifact : null,
+    };
+  });
+  const queued: QueuedItem[] = raw.gates.map((g) => ({
+    id: g.id ?? "",
+    reason: firstSentence(g.reason ?? "", 110),
+    title: g.title ?? g.id ?? "",
+  }));
+
+  return {
+    activity,
+    contributions: {
+      checked: raw.contributions.checked,
+      complete: raw.contributions.complete,
+      known: raw.contributions.known,
+    },
+    counts: {
+      landed: landed.length,
+      queued: queued.length,
+      underway: underway.length,
+      waitingOnYou: decisions.length + readyToMerge.length,
+    },
+    error: null,
+    generatedAt: null,
+    nextRefreshAt: null,
+    queued,
+    recentlyLanded: landed,
+    refreshing: false,
+    underway,
+    waitingOnYou: { decisions, readyToMerge },
+  };
 }
 
 async function crewLine(taskId: string): Promise<string> {
@@ -113,24 +220,6 @@ async function holdReason(taskId: string): Promise<string> {
   const r = await run(bin("fm-tasks-axi.sh"), ["show", taskId], { timeoutMs: 30_000 });
   const m = /hold_reason: "?(.*?)"?$/m.exec(r.stdout);
   return m && m[1] && m[1] !== "-" ? m[1] : "";
-}
-
-const repoCache = new Map<string, string>();
-async function repoSlug(projectDir: string): Promise<string> {
-  const hit = repoCache.get(projectDir);
-  if (hit !== undefined) return hit;
-  const r = await run("git", ["-C", projectDir, "remote", "get-url", "origin"], {
-    timeoutMs: 10_000,
-  });
-  const m = /github\.com[:/]([^/]+\/[^/.\s]+)/.exec(r.stdout);
-  const slug = m && m[1] ? m[1] : "";
-  repoCache.set(projectDir, slug);
-  return slug;
-}
-
-function prNumber(url: string): number | null {
-  const m = /\/pull\/(\d+)/.exec(url);
-  return m && m[1] ? Number(m[1]) : null;
 }
 
 async function linksFor(
@@ -164,63 +253,21 @@ async function linksFor(
       pr = r.code === 0 && r.stdout.trim().startsWith("http") ? r.stdout.trim() : "";
     }
   }
-  let key = /\b([A-Z]{2,5}-\d+)\b/.exec(title)?.[1] ?? "";
-  if (!key) {
-    const r = await run(bin("fm-tasks-axi.sh"), ["show", taskId, "--full"], { timeoutMs: 25_000 });
-    key = /\b(LIV-\d+)\b/.exec(r.stdout)?.[1] ?? "";
+  let key = "";
+  if (LINEAR_BASE && LINEAR_TEAMS.length > 0) {
+    key = ticketKey(title, LINEAR_TEAMS);
+    if (!key) {
+      const r = await run(bin("fm-tasks-axi.sh"), ["show", taskId, "--full"], {
+        timeoutMs: 25_000,
+      });
+      key = ticketKey(r.stdout, LINEAR_TEAMS);
+    }
   }
   const num = pr ? prNumber(pr) : null;
   return {
-    linear: key && LINEAR_BASE ? { key, url: LINEAR_BASE + key } : null,
+    linear: key ? { key, url: LINEAR_BASE + key } : null,
     pullRequest: pr && num !== null ? { number: num, url: pr } : null,
   };
-}
-
-const KIND_LABEL: Record<string, ActivityEvent["kind"]> = {
-  done: "finished",
-  resolved: "decision_made",
-  "needs-decision": "decision_asked",
-  blocked: "blocked",
-};
-
-async function activityFeed(names: Map<string, string>, limit = 16): Promise<ActivityEvent[]> {
-  const events: ActivityEvent[] = [];
-  const now = Date.now();
-  let files: string[] = [];
-  try {
-    files = (await readdir(path.join(FM_HOME, "state"))).filter((f) => f.endsWith(".status"));
-  } catch {
-    return [];
-  }
-  for (const f of files) {
-    const p = path.join(FM_HOME, "state", f);
-    try {
-      if (now - (await stat(p)).mtimeMs > 86_400_000) continue;
-      const lines = (await readFile(p, "utf8")).split("\n").slice(-80);
-      const taskId = f.slice(0, -7);
-      for (const line of lines) {
-        const m = /^([\w-]+)((?: \[[^\]]+\])*):\s*(.*)$/.exec(line);
-        const kind = m && m[1] ? KIND_LABEL[m[1]] : undefined;
-        const at = m && m[2] ? /\[at=(\d+)\]/.exec(m[2])?.[1] : undefined;
-        if (!m || !kind || !at) continue;
-        events.push({
-          at: new Date(Number(at) * 1000).toISOString(),
-          taskId,
-          taskName: names.get(taskId) ?? taskId.replace(/-/g, " "),
-          kind,
-          text: firstSentence(m[3] ?? "", 150),
-        });
-      }
-    } catch {
-      /* skip unreadable status */
-    }
-  }
-  events.sort((a, b) => b.at.localeCompare(a.at));
-  return events.slice(0, limit);
-}
-
-function taskKind(kind: string): Task["kind"] {
-  return kind === "ship" || kind === "scout" ? kind : "other";
 }
 
 /** Like Promise.all over items.map(fn), but with at most `limit` calls in flight. */
@@ -241,13 +288,84 @@ async function mapLimit<T, R>(
   return out;
 }
 
-/** Each task spawns up to four processes, so this caps a refresh at about 4 × TASK_CONCURRENCY. */
-const TASK_CONCURRENCY = 4;
+async function pipelineFor(meta: Record<string, string>): Promise<Pipeline | null> {
+  if (meta["mode"] !== "no-mistakes" || !meta["worktree"]) return null;
+  try {
+    await stat(meta["worktree"]);
+  } catch {
+    return null;
+  }
+  const r = await run("no-mistakes", ["axi", "status"], {
+    cwd: meta["worktree"],
+    timeoutMs: 40_000,
+  });
+  return r.stdout ? parsePipeline(r.stdout) : null;
+}
 
-interface TaskInfo {
-  crew: string;
-  links: TaskLinks | null;
-  pipeline: Pipeline | null;
+function prNumber(url: string): number | null {
+  const m = /\/pull\/(\d+)/.exec(url);
+  return m && m[1] ? Number(m[1]) : null;
+}
+
+async function readMeta(taskId: string): Promise<Record<string, string>> {
+  const meta: Record<string, string> = {};
+  try {
+    const text = await readFile(path.join(FM_HOME, "state", `${taskId}.meta`), "utf8");
+    for (const line of text.split("\n")) {
+      const i = line.indexOf("=");
+      if (i > 0) meta[line.slice(0, i)] = line.slice(i + 1);
+    }
+  } catch {
+    /* no record */
+  }
+  return meta;
+}
+
+async function repoSlug(projectDir: string): Promise<string> {
+  const hit = repoCache.get(projectDir);
+  if (hit !== undefined) return hit;
+  const r = await run("git", ["-C", projectDir, "remote", "get-url", "origin"], {
+    timeoutMs: 10_000,
+  });
+  const slug = slugFromRemote(r.stdout);
+  // Only cache a real answer, so a timeout is retried on the next refresh.
+  if (r.code === 0) repoCache.set(projectDir, slug);
+  return slug;
+}
+
+function run(
+  cmd: string,
+  args: string[],
+  opts: { cwd?: string; input?: string; timeoutMs?: number } = {},
+): Promise<RunResult> {
+  return new Promise((resolve) => {
+    const child = execFile(
+      cmd,
+      args,
+      {
+        cwd: opts.cwd ?? FM_HOME,
+        env: { ...process.env, FM_HOME, NO_COLOR: "1" },
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: opts.timeoutMs ?? 60_000,
+      },
+      (error, stdout, stderr) => {
+        const code =
+          error && typeof (error as { code?: unknown }).code === "number"
+            ? (error as { code: number }).code
+            : error
+              ? 1
+              : 0;
+        // A missing binary or a timeout leaves stderr empty; keep the reason.
+        const err = stripVTControlCharacters(String(stderr)) || (error ? error.message : "");
+        resolve({ code, stderr: err, stdout: stripVTControlCharacters(String(stdout)) });
+      },
+    );
+    if (opts.input !== undefined) {
+      // EPIPE when the child exits before reading; the exit code already reports the failure.
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(opts.input);
+    }
+  });
 }
 
 /** Crew line for any task; pipeline and links only for tasks in flight (title given). */
@@ -265,118 +383,30 @@ async function taskInfo(
   return { crew, links, pipeline };
 }
 
-async function build(): Promise<Bearings> {
-  const snap = await run(bin("fm-bearings-snapshot.sh"), ["--json"], { timeoutMs: 150_000 });
-  if (snap.code !== 0 || !snap.stdout.trim())
-    throw new Error((snap.stderr || "snapshot failed").trim().slice(0, 300));
-  const raw = JSON.parse(snap.stdout) as RawSnapshot;
-  const recordedPr = new Map(raw.recorded_prs.map((p) => [p.id, p.url]));
-  const names = new Map(raw.in_flight.map((t) => [t.id, t.name]));
-
-  const ids = [...new Set([...names.keys(), ...raw.recorded_prs.map((p) => p.id)])];
-  const [infoList, holdList, activity] = await Promise.all([
-    mapLimit(ids, TASK_CONCURRENCY, (id) => taskInfo(id, names.get(id), recordedPr.get(id) ?? "")),
-    mapLimit(raw.decisions_open, TASK_CONCURRENCY, (d) => holdReason(d.id)),
-    activityFeed(names),
-  ]);
-  const info = new Map(ids.map((id, i) => [id, infoList[i]]));
-  const holds = new Map(raw.decisions_open.map((d, i) => [d.id, holdList[i] ?? ""]));
-
-  const underway: Task[] = raw.in_flight.map((t) => {
-    const i = info.get(t.id);
-    const line = i?.crew || t.doing;
-    const pipeline = i?.pipeline ?? null;
-    const { state, sentence } = describeTask(line, pipeline, readyForReview(line));
-    return {
-      id: t.id,
-      name: t.name,
-      repo: t.repo,
-      kind: taskKind(t.kind),
-      state,
-      status: sentence,
-      links: i?.links ?? { linear: null, pullRequest: null },
-      pipeline,
-    };
-  });
-
-  const decisions: Decision[] = raw.decisions_open.map((d) => {
-    const title = (d.summary.split(":")[0] ?? d.id).trim();
-    const reason = holds.get(d.id) || d.summary;
-    const qs = parseQuestions(reason);
-    return {
-      id: d.id,
-      title,
-      summary:
-        qs.length > 0
-          ? `${qs.length} question${qs.length === 1 ? "" : "s"} to answer. The recommended option is marked.`
-          : "Needs your answer.",
-      questions: qs.map((q, i) => ({ number: i + 1, title: q.title, options: q.options })),
-      text: qs.length > 0 ? null : reason,
-    };
-  });
-
-  const landedUrls = new Set(raw.landed.map((l) => l.artifact));
-  const readyToMerge: ReadyToMerge[] = [];
-  for (const p of raw.recorded_prs) {
-    if (landedUrls.has(p.url) || !readyForReview(info.get(p.id)?.crew ?? "")) continue;
-    const number = prNumber(p.url);
-    if (number === null) continue;
-    readyToMerge.push({
-      taskId: p.id,
-      name: names.get(p.id) ?? p.id,
-      summary: "Ready for you to review and merge.",
-      pullRequest: { number, url: p.url },
-    });
-  }
-
-  const landed: LandedItem[] = raw.landed.map((l) => {
-    const isUrl = l.artifact.startsWith("http");
-    return {
-      id: l.id,
-      title: l.what,
-      kind: isUrl ? "pull_request" : "report",
-      url: isUrl ? l.artifact : null,
-      path: isUrl ? null : l.artifact,
-    };
-  });
-  const queued: QueuedItem[] = raw.gates.map((g) => ({
-    id: g.id ?? "",
-    title: g.title ?? g.id ?? "",
-    reason: firstSentence(g.reason ?? "", 110),
-  }));
-
-  return {
-    generatedAt: null,
-    nextRefreshAt: null,
-    refreshing: false,
-    error: null,
-    counts: {
-      waitingOnYou: decisions.length + readyToMerge.length,
-      underway: underway.length,
-      landed: landed.length,
-      queued: queued.length,
-    },
-    waitingOnYou: { decisions, readyToMerge },
-    underway,
-    recentlyLanded: landed,
-    queued,
-    activity,
-    contributions: {
-      known: raw.contributions.known,
-      checked: raw.contributions.checked,
-      complete: raw.contributions.complete,
-    },
-  };
+function taskKind(kind: string): Task["kind"] {
+  return kind === "ship" || kind === "scout" ? kind : "other";
 }
 
 // ---------- cache and refresh loop ----------
 
 let current: Bearings | null = null;
 let generatedMs = 0;
-let refreshing = false;
 let lastError: string | null = null;
 let nextMs = 0;
+let refreshing = false;
 let timer: ReturnType<typeof setTimeout> | undefined;
+
+/** The latest bearings, or null before the first refresh finishes. */
+export function getBearings(): Bearings | null {
+  if (!current) return null;
+  return {
+    ...current,
+    error: lastError,
+    generatedAt: new Date(generatedMs).toISOString(),
+    nextRefreshAt: refreshing ? null : new Date(nextMs).toISOString(),
+    refreshing,
+  };
+}
 
 /** Rebuild now. Every finished rebuild, scheduled or manual, schedules the next one a full interval later. */
 export async function refresh(): Promise<void> {
@@ -391,79 +421,62 @@ export async function refresh(): Promise<void> {
   } finally {
     refreshing = false;
     clearTimeout(timer);
-    nextMs = Date.now() + REFRESH_SECONDS * 1000;
-    timer = setTimeout(() => void refresh(), REFRESH_SECONDS * 1000);
+    const wait = (lastError ? RETRY_SECONDS : REFRESH_SECONDS) * 1000;
+    nextMs = Date.now() + wait;
+    timer = setTimeout(() => void refresh(), wait);
     timer.unref();
   }
+}
+
+export async function requestRefresh(): Promise<void> {
+  void refresh();
 }
 
 export function startRefreshLoop(): void {
   void refresh();
 }
 
-/** The latest bearings, or null before the first refresh finishes. */
-export function getBearings(): Bearings | null {
-  if (!current) return null;
-  return {
-    ...current,
-    generatedAt: new Date(generatedMs).toISOString(),
-    nextRefreshAt: refreshing ? null : new Date(nextMs).toISOString(),
-    refreshing,
-    error: lastError,
-  };
-}
-
 export function status(): {
-  ready: boolean;
-  refreshing: boolean;
   error: string | null;
   generatedAt: string | null;
+  ready: boolean;
+  refreshing: boolean;
 } {
   return {
-    ready: current !== null,
-    refreshing,
     error: lastError,
     generatedAt: current ? new Date(generatedMs).toISOString() : null,
+    ready: current !== null,
+    refreshing,
   };
 }
 
 // ---------- replies to firstmate (inbox notes) ----------
 
-async function sendNote(body: string): Promise<void> {
-  const r = await run(bin("fm-inbox.sh"), ["note", "--request-id", randomUUID(), "-"], {
-    timeoutMs: 30_000,
-    input: body,
-  });
-  if (r.code !== 0) throw new Error((r.stderr || r.stdout || "inbox failed").trim().slice(0, 200));
-}
-
-export async function sendGeneralNote(text: string): Promise<void> {
-  await sendNote(`Reply from the Fleet Bearings API (general note):\n${text}`);
-}
-
 export type AnswerOutcome =
   | { ok: true }
-  | { ok: false; status: 404 | 422; code: string; message: string };
+  | { code: string; message: string; ok: false; status: 404 | 422 };
 
 export async function sendAnswers(decisionId: string, req: AnswerRequest): Promise<AnswerOutcome> {
   const b = getBearings();
   const decision = b?.waitingOnYou.decisions.find((d) => d.id === decisionId);
   if (!decision)
     return {
-      ok: false,
-      status: 404,
       code: "decision_not_found",
       message: `No open decision with id "${decisionId}".`,
+      ok: false,
+      status: 404,
     };
   const lines: string[] = [];
+  // A free-text decision has no structured questions; it is answered as question 1.
+  const freeText = decision.questions.length === 0;
   for (const a of req.answers) {
     const q = decision.questions.find((x) => x.number === a.question);
-    if (!q && decision.questions.length > 0) {
+    if (!q && !(freeText && a.question === 1)) {
       return {
-        ok: false,
-        status: 422,
         code: "unknown_question",
         message: `Decision "${decisionId}" has no question ${a.question}.`,
+        ok: false,
+        status: 422,
       };
     }
     lines.push(q ? `${q.number}. ${q.title} → ${a.answer}` : a.answer);
@@ -474,6 +487,14 @@ export async function sendAnswers(decisionId: string, req: AnswerRequest): Promi
   return { ok: true };
 }
 
-export async function requestRefresh(): Promise<void> {
-  void refresh();
+export async function sendGeneralNote(text: string): Promise<void> {
+  await sendNote(`Reply from the Fleet Bearings API (general note):\n${text}`);
+}
+
+async function sendNote(body: string): Promise<void> {
+  const r = await run(bin("fm-inbox.sh"), ["note", "--request-id", randomUUID(), "-"], {
+    input: body,
+    timeoutMs: 30_000,
+  });
+  if (r.code !== 0) throw new Error((r.stderr || r.stdout || "inbox failed").trim().slice(0, 200));
 }

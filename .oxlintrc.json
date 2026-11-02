@@ -4,7 +4,16 @@
   "categories": {
     "correctness": "error"
   },
-  "rules": {},
+  "rules": {
+    "sort-keys": [
+      "error",
+      "asc",
+      {
+        "caseSensitive": false,
+        "natural": true
+      }
+    ]
+  },
   "env": {
     "builtin": true,
     "node": true

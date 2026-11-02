@@ -32,19 +32,22 @@ Data is rebuilt every 5 minutes. `POST /api/v1/refresh` rebuilds it now.
 | POST   | `/api/v1/refresh`                             | Rebuild now                                                          |
 | GET    | `/health`                                     | Health                                                               |
 
-The API never answers a decision, merges, or changes a task. Answers and notes become Firstmate inbox notes that it reads.
+The API never answers a decision, merges, or changes a task. Answers and notes become Firstmate inbox notes that it reads. A decision with no structured questions is answered as question 1.
+
+Writes (`POST`) that carry an `Origin` header from another site get a 403, so a web page cannot post to the API from your browser. If the first snapshot fails, it is retried every 30 seconds and the 503 says why.
 
 ## Settings
 
-| Variable                     | Default                     | What                                                                                                          |
-| ---------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `FM_HOME`                    | three folders above `src/`  | The Firstmate home to read                                                                                    |
-| `BEARINGS_API_PORT`          | `4748`                      | Port                                                                                                          |
-| `BEARINGS_API_HOST`          | `127.0.0.1`                 | Interface                                                                                                     |
-| `BEARINGS_API_KEY`           | none                        | When set, `/api/v1/*` needs `Authorization: Bearer <key>`                                                     |
-| `BEARINGS_API_ALLOWED_HOSTS` | `localhost,127.0.0.1,[::1]` | Host names it answers to                                                                                      |
-| `BEARINGS_API_REFRESH`       | `300`                       | Seconds between rebuilds                                                                                      |
-| `BEARINGS_LINEAR_BASE`       | none                        | Ticket link base, for example `https://linear.app/<workspace>/issue/`. Without it, tasks carry no ticket link |
+| Variable                     | Default                     | What                                                                                                                 |
+| ---------------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `FM_HOME`                    | three folders above `src/`  | The Firstmate home to read                                                                                           |
+| `BEARINGS_API_PORT`          | `4748`                      | Port                                                                                                                 |
+| `BEARINGS_API_HOST`          | `127.0.0.1`                 | Interface                                                                                                            |
+| `BEARINGS_API_KEY`           | none                        | When set, `/api/v1/*` needs `Authorization: Bearer <key>`                                                            |
+| `BEARINGS_API_ALLOWED_HOSTS` | `localhost,127.0.0.1,[::1]` | Host names it answers to                                                                                             |
+| `BEARINGS_API_REFRESH`       | `300`                       | Seconds between rebuilds                                                                                             |
+| `BEARINGS_LINEAR_BASE`       | none                        | Ticket link base, for example `https://linear.app/<workspace>/issue/`                                                |
+| `BEARINGS_LINEAR_TEAMS`      | none                        | Linear team keys to recognise, for example `LIV,ENG`. Tasks get a ticket link only when both Linear settings are set |
 
 `start.sh` also reads an optional `.env.local` (not committed).
 
@@ -54,8 +57,9 @@ The API never answers a decision, merges, or changes a task. Answers and notes b
 pnpm typecheck      # strict TypeScript
 pnpm lint           # oxlint
 pnpm fmt:check      # oxfmt (pnpm fmt to fix)
-pnpm check          # validates the OpenAPI document, then calls the running API and
-                    # checks every response against the schemas in the document
+pnpm check          # validates the OpenAPI document and runs the parsers on samples, then calls the
+                    # running API and checks every response against the schemas in the document
+pnpm check --offline  # spec and parser checks only; no server needed (this is what CI runs)
 ```
 
 The spec is in `src/openapi.ts` and mirrors the types in `src/types.ts`.
