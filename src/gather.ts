@@ -1,3 +1,14 @@
+/**
+ * Builds the {@link Bearings} snapshot, keeps it cached and refreshed, and sends notes to
+ * Firstmate's inbox.
+ *
+ * @remarks
+ * The snapshot is built by running scripts in `$FM_HOME/bin/` (plus `git`, `gh` and
+ * `no-mistakes`) and reading `$FM_HOME/state/`. Building takes a while, so it runs in the
+ * background on an interval and every request reads the cached result.
+ *
+ * @packageDocumentation
+ */
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
@@ -10,10 +21,12 @@ import {
   firstSentence,
   parsePipeline,
   parseQuestions,
+  plural,
   readyForReview,
   slugFromRemote,
   ticketKey,
 } from "./status.ts";
+import { ACTIVITY_LIMIT } from "./types.ts";
 import type {
   ActivityEvent,
   AnswerRequest,
@@ -22,170 +35,221 @@ import type {
   LandedItem,
   Pipeline,
   QueuedItem,
+  RawDecision,
+  RawGate,
+  RawLanded,
   RawSnapshot,
+  RawTask,
   ReadyToMerge,
   Task,
   TaskLinks,
 } from "./types.ts";
 
+// ---------- settings ----------
+
 // HERE comes first because FM_HOME is built from it.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The Firstmate home directory.
+ *
+ * @defaultValue Two levels above this repo, which assumes the repo sits inside a Firstmate home.
+ */
 export const FM_HOME = process.env["FM_HOME"] ?? path.resolve(HERE, "..", "..", "..");
-const KIND_LABEL: Record<string, ActivityEvent["kind"]> = {
+
+/** Status files untouched for longer than this are left out of the activity feed. */
+const ACTIVITY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** How many lines from the end of each status file the activity feed reads. */
+const ACTIVITY_TAIL_LINES = 80;
+
+/** The status file prefix for each kind of event the activity feed reports. */
+const EVENT_KIND: Record<string, ActivityEvent["kind"]> = {
   blocked: "blocked",
   done: "finished",
   "needs-decision": "decision_asked",
   resolved: "decision_made",
 };
-/** Base URL for ticket links, for example https://linear.app/<workspace>/issue/. */
+
+/** The base URL for ticket links, for example `https://linear.app/<workspace>/issue/`. */
 const LINEAR_BASE = process.env["BEARINGS_LINEAR_BASE"] ?? "";
-/** Linear team keys to recognise, for example LIV,ENG. Tasks get a ticket link only when this and LINEAR_BASE are set. */
+
+/**
+ * The Linear team keys to recognise, for example `LIV,ENG`.
+ *
+ * @remarks
+ * Tasks get a ticket link only when this and {@link LINEAR_BASE} are both set. Keys that are
+ * not plain letters and digits are ignored, which keeps them safe to use in a regular expression.
+ */
 const LINEAR_TEAMS = (process.env["BEARINGS_LINEAR_TEAMS"] ?? "")
   .split(",")
-  .map((t) => t.trim().toUpperCase())
-  .filter((t) => /^[A-Z0-9]+$/.test(t));
+  .map((team) => team.trim().toUpperCase())
+  .filter((team) => /^[A-Z0-9]+$/.test(team));
+
+/** Seconds between scheduled rebuilds. */
 export const REFRESH_SECONDS = Number(process.env["BEARINGS_API_REFRESH"] ?? 300);
+
 /** After a failed rebuild, retry this soon rather than waiting a full interval. */
 const RETRY_SECONDS = Math.min(30, REFRESH_SECONDS);
+
 /**
+ * How many tasks are inspected at once.
+ *
+ * @remarks
  * Each task spawns up to five processes (crew, no-mistakes, git, gh, fm-tasks), and hold reasons
- * run alongside with the same limit, so a refresh peaks at about 6 × TASK_CONCURRENCY processes.
+ * are read alongside with the same limit, so a refresh peaks at about 6 × TASK_CONCURRENCY
+ * processes.
  */
 const TASK_CONCURRENCY = 4;
 
-const repoCache = new Map<string, string>();
+/** `owner/name` slugs by project directory. Remotes rarely change, so they are kept for good. */
+const repoSlugCache = new Map<string, string>();
 
+// ---------- types ----------
+
+/** The outcome of an inbox write that can be refused before anything is sent. */
+export type AnswerOutcome =
+  | { ok: true }
+  | {
+      /** A stable error code for the API response. */
+      code: string;
+      /** A plain-English message for the API response. */
+      message: string;
+      ok: false;
+      /** The HTTP status to respond with. */
+      status: 404 | 422;
+    };
+
+/** Options for {@link run}. */
+interface RunOptions {
+  /** The working directory. Defaults to {@link FM_HOME}. */
+  cwd?: string;
+  /** Text to write to the command's stdin. */
+  input?: string;
+  /** How long to wait before the command is killed. Defaults to 60 seconds. */
+  timeoutMs?: number;
+}
+
+/** What a finished command produced. Terminal colour codes are already stripped. */
 interface RunResult {
+  /** The exit code: 0 for success, and 1 when the command failed without one (timeout, missing). */
   code: number;
+  /** Stderr, or the failure reason when the command produced none. */
   stderr: string;
   stdout: string;
 }
 
+/** The current state of the cache, as `GET /health` reports it. */
+export interface ServiceStatus {
+  /** The last refresh error, or `null` when the last refresh succeeded. */
+  error: string | null;
+  /** When the cached snapshot was built, or `null` before the first one. */
+  generatedAt: string | null;
+  /** Whether a snapshot exists yet. */
+  ready: boolean;
+  /** Whether a rebuild is running now. */
+  refreshing: boolean;
+}
+
+/** What was learned about one task by running its scripts. */
 interface TaskInfo {
+  /** The first line of `fm-crew-state.sh <id>`. */
   crew: string;
+  /** Ticket and pull request links, or `null` for tasks no longer in flight. */
   links: TaskLinks | null;
+  /** The validation run, or `null` when there is none or the task is no longer in flight. */
   pipeline: Pipeline | null;
 }
 
-async function activityFeed(names: Map<string, string>, limit = 16): Promise<ActivityEvent[]> {
-  const events: ActivityEvent[] = [];
-  const now = Date.now();
-  let files: string[] = [];
+// ---------- building the snapshot ----------
+
+/**
+ * Read recent events from every `state/*.status` file.
+ *
+ * @remarks
+ * A status line looks like `done [at=1730600000]: Shipped the fix.`. Only lines with a known
+ * prefix (see {@link EVENT_KIND}) and an `at` timestamp become events. Files that cannot be read
+ * are skipped.
+ *
+ * @param names - Task names by id, used to label each event.
+ * @returns At most {@link ACTIVITY_LIMIT} events, newest first.
+ */
+async function activityFeed(names: Map<string, string>): Promise<ActivityEvent[]> {
+  const stateDir = path.join(FM_HOME, "state");
+  let files: string[];
   try {
-    files = (await readdir(path.join(FM_HOME, "state"))).filter((f) => f.endsWith(".status"));
+    files = (await readdir(stateDir)).filter((file) => file.endsWith(".status"));
   } catch {
     return [];
   }
-  for (const f of files) {
-    const p = path.join(FM_HOME, "state", f);
+
+  const events: ActivityEvent[] = [];
+  const now = Date.now();
+  for (const file of files) {
+    const filePath = path.join(stateDir, file);
+    const taskId = file.slice(0, -".status".length);
     try {
-      if (now - (await stat(p)).mtimeMs > 86_400_000) continue;
-      const lines = (await readFile(p, "utf8")).split("\n").slice(-80);
-      const taskId = f.slice(0, -7);
+      if (now - (await stat(filePath)).mtimeMs > ACTIVITY_MAX_AGE_MS) continue;
+      const lines = (await readFile(filePath, "utf8")).split("\n").slice(-ACTIVITY_TAIL_LINES);
       for (const line of lines) {
-        const m = /^([\w-]+)((?: \[[^\]]+\])*):\s*(.*)$/.exec(line);
-        const kind = m && m[1] ? KIND_LABEL[m[1]] : undefined;
-        const at = m && m[2] ? /\[at=(\d+)\]/.exec(m[2])?.[1] : undefined;
-        if (!m || !kind || !at) continue;
+        // prefix, then zero or more ` [key=value]` tags, then `: text`.
+        const match = /^([\w-]+)((?: \[[^\]]+\])*):\s*(.*)$/.exec(line);
+        const kind = match?.[1] ? EVENT_KIND[match[1]] : undefined;
+        const atSeconds = match?.[2] ? /\[at=(\d+)\]/.exec(match[2])?.[1] : undefined;
+        if (!kind || !atSeconds) continue;
         events.push({
-          at: new Date(Number(at) * 1000).toISOString(),
+          at: new Date(Number(atSeconds) * 1000).toISOString(),
           kind,
           taskId,
           taskName: names.get(taskId) ?? taskId.replace(/-/g, " "),
-          text: firstSentence(m[3] ?? "", 150),
+          text: firstSentence(match?.[3] ?? "", 150),
         });
       }
     } catch {
-      /* skip unreadable status */
+      // The file vanished or is unreadable; leave its events out.
     }
   }
   events.sort((a, b) => b.at.localeCompare(a.at));
-  return events.slice(0, limit);
+  return events.slice(0, ACTIVITY_LIMIT);
 }
 
+/** The path of a Firstmate script in `$FM_HOME/bin/`. */
 function bin(name: string): string {
   return path.join(FM_HOME, "bin", name);
 }
 
+/**
+ * Build a fresh snapshot.
+ *
+ * @remarks
+ * The time fields (`generatedAt`, `nextRefreshAt`, `refreshing`, `error`) are left empty here;
+ * {@link getBearings} fills them in from the cache state when the snapshot is read.
+ *
+ * @throws When the snapshot script fails or prints something that is not JSON.
+ */
 async function build(): Promise<Bearings> {
-  const snap = await run(bin("fm-bearings-snapshot.sh"), ["--json"], { timeoutMs: 150_000 });
-  if (snap.code !== 0 || !snap.stdout.trim())
-    throw new Error((snap.stderr || "snapshot failed").trim().slice(0, 300));
-  const raw = JSON.parse(snap.stdout) as RawSnapshot;
-  const recordedPr = new Map(raw.recorded_prs.map((p) => [p.id, p.url]));
-  const names = new Map(raw.in_flight.map((t) => [t.id, t.name]));
+  const raw = await readSnapshot();
+  const names = new Map(raw.in_flight.map((task) => [task.id, task.name]));
+  const recordedPrs = new Map(raw.recorded_prs.map((pr) => [pr.id, pr.url]));
 
-  const ids = [...new Set([...names.keys(), ...raw.recorded_prs.map((p) => p.id)])];
-  const [infoList, holdList, activity] = await Promise.all([
-    mapLimit(ids, TASK_CONCURRENCY, (id) => taskInfo(id, names.get(id), recordedPr.get(id) ?? "")),
-    mapLimit(raw.decisions_open, TASK_CONCURRENCY, (d) => holdReason(d.id)),
+  // Every task in flight, plus finished ones with a recorded PR, which may be ready to merge.
+  const taskIds = [...new Set([...names.keys(), ...recordedPrs.keys()])];
+  const [infoList, holdReasons, activity] = await Promise.all([
+    mapLimit(taskIds, TASK_CONCURRENCY, (id) =>
+      taskInfo(id, names.get(id), recordedPrs.get(id) ?? ""),
+    ),
+    mapLimit(raw.decisions_open, TASK_CONCURRENCY, (decision) => holdReason(decision.id)),
     activityFeed(names),
   ]);
-  const info = new Map(ids.map((id, i) => [id, infoList[i]]));
-  const holds = new Map(raw.decisions_open.map((d, i) => [d.id, holdList[i] ?? ""]));
+  const infoById = new Map(taskIds.map((id, i) => [id, infoList[i]]));
 
-  const underway: Task[] = raw.in_flight.map((t) => {
-    const i = info.get(t.id);
-    const line = i?.crew || t.doing;
-    const pipeline = i?.pipeline ?? null;
-    const { state, sentence } = describeTask(line, pipeline, readyForReview(line));
-    return {
-      id: t.id,
-      kind: taskKind(t.kind),
-      links: i?.links ?? { linear: null, pullRequest: null },
-      name: t.name,
-      pipeline,
-      repo: t.repo,
-      state,
-      status: sentence,
-    };
-  });
-
-  const decisions: Decision[] = raw.decisions_open.map((d) => {
-    const title = (d.summary.split(":")[0] ?? d.id).trim();
-    const reason = holds.get(d.id) || d.summary;
-    const qs = parseQuestions(reason);
-    return {
-      id: d.id,
-      questions: qs.map((q, i) => ({ number: i + 1, options: q.options, title: q.title })),
-      summary:
-        qs.length > 0
-          ? `${qs.length} question${qs.length === 1 ? "" : "s"} to answer. The recommended option is marked.`
-          : "Needs your answer.",
-      text: qs.length > 0 ? null : reason,
-      title,
-    };
-  });
-
-  const landedUrls = new Set(raw.landed.map((l) => l.artifact));
-  const readyToMerge: ReadyToMerge[] = [];
-  for (const p of raw.recorded_prs) {
-    if (landedUrls.has(p.url) || !readyForReview(info.get(p.id)?.crew ?? "")) continue;
-    const number = prNumber(p.url);
-    if (number === null) continue;
-    readyToMerge.push({
-      name: names.get(p.id) ?? p.id,
-      pullRequest: { number, url: p.url },
-      summary: "Ready for you to review and merge.",
-      taskId: p.id,
-    });
-  }
-
-  const landed: LandedItem[] = raw.landed.map((l) => {
-    const isUrl = l.artifact.startsWith("http");
-    return {
-      id: l.id,
-      kind: isUrl ? "pull_request" : "report",
-      path: isUrl ? null : l.artifact,
-      title: l.what,
-      url: isUrl ? l.artifact : null,
-    };
-  });
-  const queued: QueuedItem[] = raw.gates.map((g) => ({
-    id: g.id ?? "",
-    reason: firstSentence(g.reason ?? "", 110),
-    title: g.title ?? g.id ?? "",
-  }));
+  const underway = raw.in_flight.map((task) => toTask(task, infoById.get(task.id)));
+  const decisions = raw.decisions_open.map((decision, i) =>
+    toDecision(decision, holdReasons[i] || decision.summary),
+  );
+  const readyToMerge = findReadyToMerge(raw, infoById, names);
+  const recentlyLanded = raw.landed.map(toLandedItem);
+  const queued = raw.gates.map(toQueuedItem);
 
   return {
     activity,
@@ -195,7 +259,7 @@ async function build(): Promise<Bearings> {
       known: raw.contributions.known,
     },
     counts: {
-      landed: landed.length,
+      landed: recentlyLanded.length,
       queued: queued.length,
       underway: underway.length,
       waitingOnYou: decisions.length + readyToMerge.length,
@@ -204,140 +268,228 @@ async function build(): Promise<Bearings> {
     generatedAt: null,
     nextRefreshAt: null,
     queued,
-    recentlyLanded: landed,
+    recentlyLanded,
     refreshing: false,
     underway,
     waitingOnYou: { decisions, readyToMerge },
   };
 }
 
+/** The first line of `fm-crew-state.sh <id>` (or of its stderr), at most 400 characters. */
 async function crewLine(taskId: string): Promise<string> {
-  const r = await run(bin("fm-crew-state.sh"), [taskId], { timeoutMs: 30_000 });
-  return ((r.stdout || r.stderr).trim().split("\n")[0] ?? "").slice(0, 400);
+  const result = await run(bin("fm-crew-state.sh"), [taskId], { timeoutMs: 30_000 });
+  const firstLine = (result.stdout || result.stderr).trim().split("\n")[0] ?? "";
+  return firstLine.slice(0, 400);
 }
 
+/**
+ * The exit code of a command run by `execFile`.
+ *
+ * @param error - The error `execFile` passed to its callback, or `null` on success.
+ * @returns 0 on success, the process's exit code when it has one, and otherwise 1 (the command
+ *   was not found, timed out, or was killed).
+ */
+function exitCode(error: { code?: unknown } | null): number {
+  if (!error) return 0;
+  return typeof error.code === "number" ? error.code : 1;
+}
+
+/**
+ * The pull requests waiting for the captain to merge.
+ *
+ * @remarks
+ * A recorded pull request is ready when it has not landed yet and its task's crew line says
+ * the checks are green.
+ */
+function findReadyToMerge(
+  raw: RawSnapshot,
+  infoById: Map<string, TaskInfo | undefined>,
+  names: Map<string, string>,
+): ReadyToMerge[] {
+  const landedUrls = new Set(raw.landed.map((item) => item.artifact));
+  const ready: ReadyToMerge[] = [];
+  for (const pr of raw.recorded_prs) {
+    if (landedUrls.has(pr.url)) continue;
+    if (!readyForReview(infoById.get(pr.id)?.crew ?? "")) continue;
+    const number = prNumber(pr.url);
+    if (number === null) continue;
+    ready.push({
+      name: names.get(pr.id) ?? pr.id,
+      pullRequest: { number, url: pr.url },
+      summary: "Ready for you to review and merge.",
+      taskId: pr.id,
+    });
+  }
+  return ready;
+}
+
+/** A task's hold reason from `fm-tasks-axi.sh show <id>`, or `""` when it has none. */
 async function holdReason(taskId: string): Promise<string> {
-  const r = await run(bin("fm-tasks-axi.sh"), ["show", taskId], { timeoutMs: 30_000 });
-  const m = /hold_reason: "?(.*?)"?$/m.exec(r.stdout);
-  return m && m[1] && m[1] !== "-" ? m[1] : "";
+  const result = await run(bin("fm-tasks-axi.sh"), ["show", taskId], { timeoutMs: 30_000 });
+  const reason = /hold_reason: "?(.*?)"?$/m.exec(result.stdout)?.[1];
+  return reason && reason !== "-" ? reason : "";
 }
 
+/**
+ * Find a task's pull request and Linear ticket.
+ *
+ * @remarks
+ * The pull request is the recorded one, else the one in the task's meta file, else the open PR
+ * for the task's branch on GitHub. The ticket key is looked for in the title first, then in the
+ * task's full record. Lookups that fail leave the link `null`.
+ *
+ * @param taskId - The task id.
+ * @param meta - The task's meta file (see {@link readMeta}).
+ * @param title - The task's name.
+ * @param recordedPr - The PR URL the snapshot recorded for the task, or `""`.
+ */
 async function linksFor(
   taskId: string,
   meta: Record<string, string>,
   title: string,
   recordedPr: string,
 ): Promise<TaskLinks> {
-  let pr = recordedPr || meta["pr"] || "";
-  if (!pr && meta["branch"] && meta["project"]) {
-    const slug = await repoSlug(meta["project"]);
-    if (slug) {
-      const r = await run(
-        "gh",
-        [
-          "pr",
-          "list",
-          "-R",
-          slug,
-          "--head",
-          meta["branch"],
-          "--state",
-          "open",
-          "--json",
-          "url",
-          "--jq",
-          ".[0].url",
-        ],
-        { timeoutMs: 25_000 },
-      );
-      pr = r.code === 0 && r.stdout.trim().startsWith("http") ? r.stdout.trim() : "";
-    }
-  }
+  let prUrl = recordedPr || meta["pr"] || "";
+  const branch = meta["branch"];
+  const project = meta["project"];
+  if (!prUrl && branch && project) prUrl = await openPrForBranch(project, branch);
+
   let key = "";
   if (LINEAR_BASE && LINEAR_TEAMS.length > 0) {
     key = ticketKey(title, LINEAR_TEAMS);
     if (!key) {
-      const r = await run(bin("fm-tasks-axi.sh"), ["show", taskId, "--full"], {
+      const result = await run(bin("fm-tasks-axi.sh"), ["show", taskId, "--full"], {
         timeoutMs: 25_000,
       });
-      key = ticketKey(r.stdout, LINEAR_TEAMS);
+      key = ticketKey(result.stdout, LINEAR_TEAMS);
     }
   }
-  const num = pr ? prNumber(pr) : null;
+
+  const number = prUrl ? prNumber(prUrl) : null;
   return {
     linear: key ? { key, url: LINEAR_BASE + key } : null,
-    pullRequest: pr && num !== null ? { number: num, url: pr } : null,
+    pullRequest: number === null ? null : { number, url: prUrl },
   };
 }
 
-/** Like Promise.all over items.map(fn), but with at most `limit` calls in flight. */
+/**
+ * Like `Promise.all(items.map(fn))`, but with at most `limit` calls running at once.
+ *
+ * @typeParam T - The item type.
+ * @typeParam R - The result type.
+ * @returns The results, in the same order as `items`.
+ */
 async function mapLimit<T, R>(
   items: T[],
   limit: number,
   fn: (item: T) => Promise<R>,
 ): Promise<R[]> {
-  const out: R[] = [];
-  let next = 0;
+  const results: R[] = [];
+  let nextIndex = 0;
+  // Each worker takes the next unclaimed item until none are left.
   const worker = async (): Promise<void> => {
-    while (next < items.length) {
-      const i = next++;
-      out[i] = await fn(items[i] as T);
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await fn(items[index] as T);
     }
   };
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return out;
+  return results;
 }
 
+/**
+ * The URL of the open GitHub pull request for a branch, or `""` when there is none or the
+ * project is not on GitHub.
+ */
+async function openPrForBranch(projectDir: string, branch: string): Promise<string> {
+  const slug = await repoSlug(projectDir);
+  if (!slug) return "";
+  const args = ["pr", "list", "-R", slug, "--head", branch, "--state", "open"];
+  const result = await run("gh", [...args, "--json", "url", "--jq", ".[0].url"], {
+    timeoutMs: 25_000,
+  });
+  const url = result.stdout.trim();
+  return result.code === 0 && url.startsWith("http") ? url : "";
+}
+
+/**
+ * A task's no-mistakes validation run.
+ *
+ * @returns The run, or `null` when the task does not use no-mistakes, its worktree is gone, or
+ *   the status output cannot be parsed.
+ */
 async function pipelineFor(meta: Record<string, string>): Promise<Pipeline | null> {
-  if (meta["mode"] !== "no-mistakes" || !meta["worktree"]) return null;
+  const worktree = meta["worktree"];
+  if (meta["mode"] !== "no-mistakes" || !worktree) return null;
   try {
-    await stat(meta["worktree"]);
+    await stat(worktree);
   } catch {
     return null;
   }
-  const r = await run("no-mistakes", ["axi", "status"], {
-    cwd: meta["worktree"],
-    timeoutMs: 40_000,
-  });
-  return r.stdout ? parsePipeline(r.stdout) : null;
+  const result = await run("no-mistakes", ["axi", "status"], { cwd: worktree, timeoutMs: 40_000 });
+  return result.stdout ? parsePipeline(result.stdout) : null;
 }
 
+/** The number in a GitHub pull request URL, or `null` when the URL is not a pull request. */
 function prNumber(url: string): number | null {
-  const m = /\/pull\/(\d+)/.exec(url);
-  return m && m[1] ? Number(m[1]) : null;
+  const digits = /\/pull\/(\d+)/.exec(url)?.[1];
+  return digits ? Number(digits) : null;
 }
 
+/**
+ * Read `state/<id>.meta`, a file of `key=value` lines.
+ *
+ * @returns The keys and values, or an empty object when the task has no meta file.
+ */
 async function readMeta(taskId: string): Promise<Record<string, string>> {
   const meta: Record<string, string> = {};
+  let text: string;
   try {
-    const text = await readFile(path.join(FM_HOME, "state", `${taskId}.meta`), "utf8");
-    for (const line of text.split("\n")) {
-      const i = line.indexOf("=");
-      if (i > 0) meta[line.slice(0, i)] = line.slice(i + 1);
-    }
+    text = await readFile(path.join(FM_HOME, "state", `${taskId}.meta`), "utf8");
   } catch {
-    /* no record */
+    return meta;
+  }
+  for (const line of text.split("\n")) {
+    const equals = line.indexOf("=");
+    if (equals > 0) meta[line.slice(0, equals)] = line.slice(equals + 1);
   }
   return meta;
 }
 
+/**
+ * Run `fm-bearings-snapshot.sh --json` and parse its output.
+ *
+ * @throws When the script fails, prints nothing, or prints something that is not JSON.
+ */
+async function readSnapshot(): Promise<RawSnapshot> {
+  const result = await run(bin("fm-bearings-snapshot.sh"), ["--json"], { timeoutMs: 150_000 });
+  if (result.code !== 0 || !result.stdout.trim()) {
+    throw new Error((result.stderr || "snapshot failed").trim().slice(0, 300));
+  }
+  return JSON.parse(result.stdout) as RawSnapshot;
+}
+
+/** The GitHub `owner/name` of a project's `origin` remote, or `""` when it is not on GitHub. */
 async function repoSlug(projectDir: string): Promise<string> {
-  const hit = repoCache.get(projectDir);
-  if (hit !== undefined) return hit;
-  const r = await run("git", ["-C", projectDir, "remote", "get-url", "origin"], {
+  const cached = repoSlugCache.get(projectDir);
+  if (cached !== undefined) return cached;
+  const result = await run("git", ["-C", projectDir, "remote", "get-url", "origin"], {
     timeoutMs: 10_000,
   });
-  const slug = slugFromRemote(r.stdout);
+  const slug = slugFromRemote(result.stdout);
   // Only cache a real answer, so a timeout is retried on the next refresh.
-  if (r.code === 0) repoCache.set(projectDir, slug);
+  if (result.code === 0) repoSlugCache.set(projectDir, slug);
   return slug;
 }
 
-function run(
-  cmd: string,
-  args: string[],
-  opts: { cwd?: string; input?: string; timeoutMs?: number } = {},
-): Promise<RunResult> {
+/**
+ * Run a command and collect its output.
+ *
+ * @remarks
+ * This never rejects: a failure is reported through {@link RunResult.code}. The command gets
+ * `FM_HOME` and `NO_COLOR=1` in its environment, and its output is capped at 16 MB.
+ */
+function run(cmd: string, args: string[], opts: RunOptions = {}): Promise<RunResult> {
   return new Promise((resolve) => {
     const child = execFile(
       cmd,
@@ -349,15 +501,13 @@ function run(
         timeout: opts.timeoutMs ?? 60_000,
       },
       (error, stdout, stderr) => {
-        const code =
-          error && typeof (error as { code?: unknown }).code === "number"
-            ? (error as { code: number }).code
-            : error
-              ? 1
-              : 0;
-        // A missing binary or a timeout leaves stderr empty; keep the reason.
-        const err = stripVTControlCharacters(String(stderr)) || (error ? error.message : "");
-        resolve({ code, stderr: err, stdout: stripVTControlCharacters(String(stdout)) });
+        // A missing binary or a timeout leaves stderr empty, so keep the error's reason instead.
+        const errorText = stripVTControlCharacters(String(stderr)) || (error ? error.message : "");
+        resolve({
+          code: exitCode(error),
+          stderr: errorText,
+          stdout: stripVTControlCharacters(String(stdout)),
+        });
       },
     );
     if (opts.input !== undefined) {
@@ -368,35 +518,102 @@ function run(
   });
 }
 
-/** Crew line for any task; pipeline and links only for tasks in flight (title given). */
+/**
+ * Gather what is known about one task.
+ *
+ * @param taskId - The task id.
+ * @param title - The task's name when it is in flight, or `undefined` when it is not. Only
+ *   tasks in flight get a pipeline and links; for the others only the crew line is needed.
+ * @param recordedPr - The PR URL the snapshot recorded for the task, or `""`.
+ */
 async function taskInfo(
   taskId: string,
   title: string | undefined,
   recordedPr: string,
 ): Promise<TaskInfo> {
   const meta = await readMeta(taskId);
+  const inFlight = title !== undefined;
   const [crew, pipeline, links] = await Promise.all([
     crewLine(taskId),
-    title === undefined ? null : pipelineFor(meta),
-    title === undefined ? null : linksFor(taskId, meta, title, recordedPr),
+    inFlight ? pipelineFor(meta) : null,
+    inFlight ? linksFor(taskId, meta, title, recordedPr) : null,
   ]);
   return { crew, links, pipeline };
 }
 
-function taskKind(kind: string): Task["kind"] {
-  return kind === "ship" || kind === "scout" ? kind : "other";
+/** Turn an open decision and its hold reason into a {@link Decision}. */
+function toDecision(decision: RawDecision, reason: string): Decision {
+  const questions = parseQuestions(reason);
+  const hasQuestions = questions.length > 0;
+  return {
+    id: decision.id,
+    questions: questions.map((question, i) => ({ number: i + 1, ...question })),
+    summary: hasQuestions
+      ? `${plural(questions.length, "question")} to answer. The recommended option is marked.`
+      : "Needs your answer.",
+    text: hasQuestions ? null : reason,
+    title: (decision.summary.split(":")[0] ?? decision.id).trim(),
+  };
+}
+
+/** Turn a landed artifact into a {@link LandedItem}. URLs are pull requests, paths are reports. */
+function toLandedItem(item: RawLanded): LandedItem {
+  const isUrl = item.artifact.startsWith("http");
+  return {
+    id: item.id,
+    kind: isUrl ? "pull_request" : "report",
+    path: isUrl ? null : item.artifact,
+    title: item.what,
+    url: isUrl ? item.artifact : null,
+  };
+}
+
+/** Turn a gate into a {@link QueuedItem}. */
+function toQueuedItem(gate: RawGate): QueuedItem {
+  return {
+    id: gate.id ?? "",
+    reason: firstSentence(gate.reason ?? "", 110),
+    title: gate.title ?? gate.id ?? "",
+  };
+}
+
+/** Turn a task in flight, plus what was gathered about it, into a {@link Task}. */
+function toTask(task: RawTask, info: TaskInfo | undefined): Task {
+  const line = info?.crew || task.doing;
+  const pipeline = info?.pipeline ?? null;
+  const { sentence, state } = describeTask(line, pipeline, readyForReview(line));
+  return {
+    id: task.id,
+    kind: task.kind === "ship" || task.kind === "scout" ? task.kind : "other",
+    links: info?.links ?? { linear: null, pullRequest: null },
+    name: task.name,
+    pipeline,
+    repo: task.repo,
+    state,
+    status: sentence,
+  };
 }
 
 // ---------- cache and refresh loop ----------
 
+/** The last snapshot that built successfully, or `null` before the first one. */
 let current: Bearings | null = null;
+/** When {@link current} was built, in epoch milliseconds. */
 let generatedMs = 0;
+/** The error from the last rebuild, or `null` when it succeeded. */
 let lastError: string | null = null;
+/** When the next scheduled rebuild is due, in epoch milliseconds. */
 let nextMs = 0;
+/** True while a rebuild is running. Stops two rebuilds from overlapping. */
 let refreshing = false;
+/** The timer for the next scheduled rebuild. */
 let timer: ReturnType<typeof setTimeout> | undefined;
 
-/** The latest bearings, or null before the first refresh finishes. */
+/**
+ * The latest snapshot, with its time fields filled in.
+ *
+ * @returns The snapshot, or `null` before the first rebuild finishes.
+ */
 export function getBearings(): Bearings | null {
   if (!current) return null;
   return {
@@ -408,7 +625,14 @@ export function getBearings(): Bearings | null {
   };
 }
 
-/** Rebuild now. Every finished rebuild, scheduled or manual, schedules the next one a full interval later. */
+/**
+ * Rebuild the snapshot now, unless a rebuild is already running.
+ *
+ * @remarks
+ * Every rebuild that finishes, scheduled or manual, schedules the next one: a full interval
+ * later after a success, or {@link RETRY_SECONDS} later after a failure. A failure keeps the
+ * previous snapshot and records the error. This never rejects.
+ */
 export async function refresh(): Promise<void> {
   if (refreshing) return;
   refreshing = true;
@@ -416,32 +640,31 @@ export async function refresh(): Promise<void> {
     current = await build();
     generatedMs = Date.now();
     lastError = null;
-  } catch (e) {
-    lastError = e instanceof Error ? e.message.slice(0, 300) : "refresh failed";
+  } catch (error) {
+    lastError = error instanceof Error ? error.message.slice(0, 300) : "refresh failed";
   } finally {
     refreshing = false;
     clearTimeout(timer);
-    const wait = (lastError ? RETRY_SECONDS : REFRESH_SECONDS) * 1000;
-    nextMs = Date.now() + wait;
-    timer = setTimeout(() => void refresh(), wait);
+    const waitMs = (lastError ? RETRY_SECONDS : REFRESH_SECONDS) * 1000;
+    nextMs = Date.now() + waitMs;
+    timer = setTimeout(() => void refresh(), waitMs);
+    // Don't keep the process alive just for the next rebuild.
     timer.unref();
   }
 }
 
+/** Start a rebuild in the background and return at once. Used by `POST /api/v1/refresh`. */
 export async function requestRefresh(): Promise<void> {
   void refresh();
 }
 
+/** Build the first snapshot in the background. Each rebuild then schedules the next. */
 export function startRefreshLoop(): void {
   void refresh();
 }
 
-export function status(): {
-  error: string | null;
-  generatedAt: string | null;
-  ready: boolean;
-  refreshing: boolean;
-} {
+/** The cache state, for `GET /health`. */
+export function status(): ServiceStatus {
   return {
     error: lastError,
     generatedAt: current ? new Date(generatedMs).toISOString() : null,
@@ -450,51 +673,78 @@ export function status(): {
   };
 }
 
-// ---------- replies to firstmate (inbox notes) ----------
+// ---------- replies to Firstmate (inbox notes) ----------
 
-export type AnswerOutcome =
-  | { ok: true }
-  | { code: string; message: string; ok: false; status: 404 | 422 };
-
-export async function sendAnswers(decisionId: string, req: AnswerRequest): Promise<AnswerOutcome> {
-  const b = getBearings();
-  const decision = b?.waitingOnYou.decisions.find((d) => d.id === decisionId);
-  if (!decision)
+/**
+ * Send answers to an open decision's questions to Firstmate as an inbox note.
+ *
+ * @remarks
+ * Firstmate reads the note and records the decision itself, so the decision stays open until
+ * it does. A decision with no structured questions takes one free-text answer as question 1.
+ *
+ * @param decisionId - The id of the task the decision gates.
+ * @param request - The validated request body.
+ * @returns `ok: true` once the note is recorded, or the reason nothing was sent.
+ * @throws When the inbox script fails.
+ */
+export async function sendAnswers(
+  decisionId: string,
+  request: AnswerRequest,
+): Promise<AnswerOutcome> {
+  const decision = getBearings()?.waitingOnYou.decisions.find((d) => d.id === decisionId);
+  if (!decision) {
     return {
       code: "decision_not_found",
       message: `No open decision with id "${decisionId}".`,
       ok: false,
       status: 404,
     };
+  }
+
+  const isFreeText = decision.questions.length === 0;
   const lines: string[] = [];
-  // A free-text decision has no structured questions; it is answered as question 1.
-  const freeText = decision.questions.length === 0;
-  for (const a of req.answers) {
-    const q = decision.questions.find((x) => x.number === a.question);
-    if (!q && !(freeText && a.question === 1)) {
+  for (const { answer, question: number } of request.answers) {
+    const question = decision.questions.find((q) => q.number === number);
+    if (question) {
+      lines.push(`${question.number}. ${question.title} → ${answer}`);
+    } else if (isFreeText && number === 1) {
+      lines.push(answer);
+    } else {
       return {
         code: "unknown_question",
-        message: `Decision "${decisionId}" has no question ${a.question}.`,
+        message: `Decision "${decisionId}" has no question ${number}.`,
         ok: false,
         status: 422,
       };
     }
-    lines.push(q ? `${q.number}. ${q.title} → ${a.answer}` : a.answer);
   }
+
   await sendNote(
     `Reply from the Fleet Bearings API to the open question "${decision.title}" (task ${decision.id}):\n${lines.join("\n")}`,
   );
   return { ok: true };
 }
 
+/**
+ * Send a free-form note to Firstmate's inbox.
+ *
+ * @throws When the inbox script fails.
+ */
 export async function sendGeneralNote(text: string): Promise<void> {
   await sendNote(`Reply from the Fleet Bearings API (general note):\n${text}`);
 }
 
+/**
+ * Pipe a note into `fm-inbox.sh note`, with a fresh request id so it is recorded once.
+ *
+ * @throws When the inbox script exits with an error. The message is the script's output.
+ */
 async function sendNote(body: string): Promise<void> {
-  const r = await run(bin("fm-inbox.sh"), ["note", "--request-id", randomUUID(), "-"], {
+  const result = await run(bin("fm-inbox.sh"), ["note", "--request-id", randomUUID(), "-"], {
     input: body,
     timeoutMs: 30_000,
   });
-  if (r.code !== 0) throw new Error((r.stderr || r.stdout || "inbox failed").trim().slice(0, 200));
+  if (result.code !== 0) {
+    throw new Error((result.stderr || result.stdout || "inbox failed").trim().slice(0, 200));
+  }
 }

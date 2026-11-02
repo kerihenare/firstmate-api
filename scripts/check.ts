@@ -1,9 +1,16 @@
 /**
  * Contract check: validates the OpenAPI document and runs the parsers against fixed samples,
  * then calls the running API and validates every response against the schemas in that document.
- * Usage: node scripts/check.ts [baseUrl] [--offline]   (default http://127.0.0.1:4748)
- * --offline stops after the spec and parser checks, so it needs no server or Firstmate home.
- * Set BEARINGS_API_KEY to the server's key when it has one; the 401 case is then checked too.
+ *
+ * @remarks
+ * Usage: `node scripts/check.ts [baseUrl] [--offline]`. The base URL defaults to
+ * `http://127.0.0.1:4748`.
+ *
+ * `--offline` stops after the spec and parser checks, so it needs no server or Firstmate home.
+ * Set `BEARINGS_API_KEY` to the server's key when it has one; the 401 case is then checked too.
+ * The process exits with 1 when any check fails.
+ *
+ * @packageDocumentation
  */
 import SwaggerParser from "@apidevtools/swagger-parser";
 import addFormatsImport from "ajv-formats";
@@ -19,74 +26,111 @@ import {
   ticketKey,
 } from "../src/status.ts";
 
+/** Options for {@link call}. */
+interface CallOptions {
+  /** The request body. */
+  body?: string;
+  /** Leave out the API key, to check the 401 case. */
+  noKey?: boolean;
+  /** An Origin header, to check the cross-site write case. */
+  origin?: string;
+  /** A Content-Type header. */
+  type?: string;
+}
+
+/** The HTTP status and parsed JSON body of a response (`null` when the body is not JSON). */
+interface CallResult {
+  json: unknown;
+  status: number;
+}
+
+/** Checks a value against a schema, returning what is wrong with it or `null` when it is valid. */
+type Validator = (value: unknown) => string | null;
+
 const args = process.argv.slice(2);
-const base = args.find((a) => !a.startsWith("--")) ?? "http://127.0.0.1:4748";
+const base = args.find((arg) => !arg.startsWith("--")) ?? "http://127.0.0.1:4748";
 const key = process.env["BEARINGS_API_KEY"] ?? "";
 const offline = args.includes("--offline");
+
+/** How many checks have failed so far. */
 let failures = 0;
-const bad = (msg: string): void => {
+
+/** Report a failed check. */
+const fail = (message: string): void => {
   failures++;
-  console.log(`  FAIL ${msg}`);
+  console.log(`  FAIL ${message}`);
 };
-const ok = (msg: string): void => console.log(`  ok   ${msg}`);
-const same = (label: string, got: unknown, want: unknown): void =>
+
+/** Report a passed check. */
+const pass = (message: string): void => console.log(`  ok   ${message}`);
+
+/** Check that two values are equal once serialised as JSON. */
+const expectEqual = (label: string, got: unknown, want: unknown): void =>
   JSON.stringify(got) === JSON.stringify(want)
-    ? ok(label)
-    : bad(`${label}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+    ? pass(label)
+    : fail(`${label}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
 
 await SwaggerParser.validate(structuredClone(openapi) as never);
-ok("OpenAPI 3.1 document is valid");
+pass("OpenAPI 3.1 document is valid");
 
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 const addFormats = addFormatsImport as unknown as (a: Ajv2020) => void;
 addFormats(ajv);
 ajv.addSchema({ $id: "spec", components: openapi["components"] as { schemas: unknown } }, "spec");
 
-async function call(
-  method: string,
-  path: string,
-  init: { body?: string; noKey?: boolean; origin?: string; type?: string } = {},
-): Promise<{ json: unknown; status: number }> {
+/** Call the running API, sending the API key unless told not to. */
+async function call(method: string, path: string, options: CallOptions = {}): Promise<CallResult> {
   const headers: Record<string, string> = {};
-  if (key && !init.noKey) headers["Authorization"] = `Bearer ${key}`;
-  if (init.type) headers["Content-Type"] = init.type;
-  if (init.origin) headers["Origin"] = init.origin;
-  const r = await fetch(base + path, { body: init.body, headers, method });
-  const text = await r.text();
+  if (key && !options.noKey) headers["Authorization"] = `Bearer ${key}`;
+  if (options.type) headers["Content-Type"] = options.type;
+  if (options.origin) headers["Origin"] = options.origin;
+  const response = await fetch(base + path, { body: options.body, headers, method });
+  const text = await response.text();
   let json: unknown = null;
   try {
     json = JSON.parse(text);
   } catch {
-    /* not json */
+    // Not JSON; leave it null.
   }
-  return { json, status: r.status };
+  return { json, status: response.status };
 }
 
-function expect(
-  label: string,
-  got: { json: unknown; status: number },
-  status: number,
-  schema?: (v: unknown) => string | null,
-): void {
-  if (got.status !== status) return bad(`${label}: expected ${status}, got ${got.status}`);
-  const problem = schema ? schema(got.json) : null;
-  if (problem) return bad(`${label}: ${problem}`);
-  ok(`${label} -> ${status}`);
+/**
+ * Check a response's status and, when a validator is given, its body.
+ *
+ * @param label - What is being checked, for the report.
+ * @param got - The response.
+ * @param status - The expected HTTP status.
+ * @param validate - Checks the body against a schema (see {@link validator}).
+ */
+function expect(label: string, got: CallResult, status: number, validate?: Validator): void {
+  if (got.status !== status) return fail(`${label}: expected ${status}, got ${got.status}`);
+  const problem = validate ? validate(got.json) : null;
+  if (problem) return fail(`${label}: ${problem}`);
+  pass(`${label} -> ${status}`);
 }
 
-function validator(name: string, array = false): (v: unknown) => string | null {
-  const fn = ajv.getSchema(`spec#/components/schemas/${name}`);
-  if (!fn) throw new Error(`no schema ${name}`);
-  return (v) => {
-    const list = array ? (Array.isArray(v) ? v : [null]) : [v];
-    for (const item of list) {
-      if (!fn(item)) return ajv.errorsText(fn.errors, { separator: "; " });
+/**
+ * A {@link Validator} for one of the spec's component schemas.
+ *
+ * @param name - The schema name, for example `Task`.
+ * @param array - Expect an array of the schema instead. A non-array then fails.
+ * @throws When the spec has no schema by that name.
+ */
+function validator(name: string, array = false): Validator {
+  const validate = ajv.getSchema(`spec#/components/schemas/${name}`);
+  if (!validate) throw new Error(`no schema ${name}`);
+  return (value) => {
+    // [null] makes a non-array fail with a readable error.
+    const items = array ? (Array.isArray(value) ? value : [null]) : [value];
+    for (const item of items) {
+      if (!validate(item)) return ajv.errorsText(validate.errors, { separator: "; " });
     }
     return null;
   };
 }
 
-// parsers, against fixed samples
+// ---------- parsers, against fixed samples ----------
 const reason =
   "Intro text. ## Engine :: Stub (Recommended) | Real OpenAI | Later ## Flag :: Set it (Recommended) | Preview | Off ## Many :: A | B | C | D | E";
 const questions = parseQuestions(reason).map((q, i) => ({ number: i + 1, ...q }));
@@ -103,9 +147,9 @@ if (
   questions[0]?.options.filter((o) => o.recommended).length !== 1 ||
   questions[2]?.options.length !== 4
 )
-  bad("parseQuestions sample");
-else if (decisionProblem) bad(`sample Decision: ${decisionProblem}`);
-else ok("parseQuestions output matches the Decision schema");
+  fail("parseQuestions sample");
+else if (decisionProblem) fail(`sample Decision: ${decisionProblem}`);
+else pass("parseQuestions output matches the Decision schema");
 
 const sampleRun = [
   "run:",
@@ -125,17 +169,17 @@ const sampleRun = [
 const pipeline = parsePipeline(sampleRun);
 const pipeProblem = pipeline ? validator("Pipeline")(pipeline) : "no pipeline parsed";
 if (pipeProblem || pipeline?.findings.length !== 2)
-  bad(`parsePipeline sample: ${pipeProblem ?? "wrong finding count"}`);
-else ok("parsePipeline output matches the Pipeline schema");
+  fail(`parsePipeline sample: ${pipeProblem ?? "wrong finding count"}`);
+else pass("parsePipeline output matches the Pipeline schema");
 const described = describeTask("state: parked · source: run-step", pipeline, false);
 if (
   described.sentence !== "Paused at the tests with 2 findings waiting for a decision." ||
   described.state !== "waiting"
 )
-  bad(`describeTask sample: ${described.sentence}`);
-else ok("describeTask writes a plain sentence for a held run");
+  fail(`describeTask sample: ${described.sentence}`);
+else pass("describeTask writes a plain sentence for a held run");
 
-same("splitRow keeps quoted commas and escapes", splitRow('a,"b, c","say \\"hi\\"",'), [
+expectEqual("splitRow keeps quoted commas and escapes", splitRow('a,"b, c","say \\"hi\\"",'), [
   "a",
   "b, c",
   'say "hi"',
@@ -152,14 +196,14 @@ const shuffled = parsePipeline(
     "    running,test,1,,2",
   ].join("\n"),
 );
-same("parsePipeline reads columns by header and keeps unknown statuses", shuffled?.steps, [
+expectEqual("parsePipeline reads columns by header and keeps unknown statuses", shuffled?.steps, [
   { findings: 0, name: "intent", status: "completed" },
   { findings: 0, name: "review", status: "unknown" },
   { findings: 1, name: "test", status: "running" },
 ]);
 const shuffledProblem = shuffled ? validator("Pipeline")(shuffled) : "no pipeline parsed";
-if (shuffledProblem) bad(`parsePipeline unknown status: ${shuffledProblem}`);
-same(
+if (shuffledProblem) fail(`parsePipeline unknown status: ${shuffledProblem}`);
+expectEqual(
   "slugFromRemote keeps dots in repo names",
   [
     slugFromRemote("git@github.com:vercel/next.js.git\n"),
@@ -168,7 +212,7 @@ same(
   ],
   ["vercel/next.js", "org/my.repo", ""],
 );
-same(
+expectEqual(
   "ticketKey only matches configured teams",
   [
     ticketKey("Fix UTF-8 handling for LIV-42", ["LIV"]),
@@ -183,7 +227,7 @@ if (offline) {
   process.exit(failures === 0 ? 0 : 1);
 }
 
-// wait for the first snapshot
+// ---------- live API: wait for the first snapshot ----------
 let ready = false;
 for (let i = 0; i < 40 && !ready; i++) {
   const h = await call("GET", "/health");
@@ -191,7 +235,7 @@ for (let i = 0; i < 40 && !ready; i++) {
   if (!ready) await new Promise((r) => setTimeout(r, 3000));
 }
 if (!ready) {
-  bad("API never became ready");
+  fail("API never became ready");
   process.exit(1);
 }
 
@@ -255,7 +299,7 @@ if (first)
     validator("Task"),
   );
 
-// request validation, without creating any note
+// ---------- request validation, without creating any note ----------
 expect(
   "POST answers wrong content type",
   await call("POST", "/api/v1/questions/x/answers", { body: "hi", type: "text/plain" }),
@@ -328,8 +372,8 @@ else console.log("  skip no open decision, so the 422 case was not exercised");
 
 const spec = await call("GET", "/openapi.json");
 if (spec.status === 200 && (spec.json as { openapi?: string } | null)?.openapi === "3.1.0")
-  ok("GET /openapi.json serves the spec");
-else bad("GET /openapi.json");
+  pass("GET /openapi.json serves the spec");
+else fail("GET /openapi.json");
 
 console.log(failures === 0 ? "\nAll checks passed." : `\n${failures} check(s) failed.`);
 process.exit(failures === 0 ? 0 : 1);

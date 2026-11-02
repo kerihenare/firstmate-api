@@ -37,3 +37,9 @@ The API never acts on Firstmate directly. The only writes are `POST /questions/{
 ## TS constraints
 
 `tsconfig` sets `erasableSyntaxOnly`, `verbatimModuleSyntax`, `allowImportingTsExtensions` and `noUncheckedIndexedAccess`. So: no enums, namespaces or parameter properties; use `import type` for types; local imports end in `.ts`; indexed access is `T | undefined`, and env vars are read as `process.env["X"]`.
+
+## Doc comments
+
+Use TSDoc (`/** … */`), not plain JSDoc. Every module opens with a `@packageDocumentation` comment. Every function, type, interface field and module-level constant gets a doc comment unless its name already says everything. Tags: `@param name - description` (with the hyphen, no `{type}`), `@returns`, `@remarks` for detail beyond the one-line summary, `@example` with a fenced block, `@throws`, `@typeParam`, `@defaultValue`, and `{@link Name}`. oxlint's `jsdoc` plugin rejects unknown tags and `@param`/`@returns` tags with no description.
+
+Write for a human reader: descriptive names over one-letter ones (loop indexes and `(a, b)` sort callbacks aside), and small named helpers over long functions.

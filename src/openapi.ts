@@ -1,20 +1,45 @@
-/** The OpenAPI 3.1 description of the Fleet Bearings API. Served at /openapi.json. */
-import { STEP_NAMES, STEP_STATUSES, TASK_STATES } from "./types.ts";
+/**
+ * The OpenAPI 3.1 description of the Fleet Bearings API, served at `/openapi.json`.
+ *
+ * @remarks
+ * The schemas here are written by hand to mirror `types.ts`. Any change to a response type or
+ * an endpoint must be made in both files; `pnpm check` validates real responses against these
+ * schemas and catches drift.
+ *
+ * @packageDocumentation
+ */
+import { ACTIVITY_LIMIT, STEP_NAMES, STEP_STATUSES, TASK_STATES } from "./types.ts";
 
+/** Any JSON value. */
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
+
+/** A JSON object, used for schemas and other parts of the OpenAPI document. */
 type Schema = { [key: string]: Json };
 
+/** A schema for an array whose items match `items`. */
 const arrayOf = (items: Schema): Schema => ({ items, type: "array" });
-const nullable = (s: Schema): Schema => ({ oneOf: [s, { type: "null" }] });
+
+/** A schema that also allows `null`. */
+const nullable = (schema: Schema): Schema => ({ oneOf: [schema, { type: "null" }] });
+
+/** A reference to one of the named {@link schemas}. */
 const ref = (name: string): Schema => ({ $ref: `#/components/schemas/${name}` });
+
+/**
+ * A string schema with a description.
+ *
+ * @param extra - More schema keywords, for example `{ format: "uri" }`.
+ */
 const str = (description: string, extra: Schema = {}): Schema => ({
   description,
   type: "string",
   ...extra,
 });
 
+/** A mutable copy of {@link STEP_NAMES}, since {@link Json} arrays are not readonly. */
 const stepNames = [...STEP_NAMES];
 
+/** The component schemas, one per type in `types.ts` that the API sends or accepts. */
 const schemas: Record<string, Schema> = {
   ActivityEvent: {
     additionalProperties: false,
@@ -343,7 +368,10 @@ const schemas: Record<string, Schema> = {
   },
 };
 
+/** A response whose body is the `Error` schema. */
 const errorResponse = (description: string): Schema => jsonBody("Error", description);
+
+/** The `{id}` path parameter. Operations override the description where it means a decision. */
 const idParam: Schema = {
   description: "Task id.",
   in: "path",
@@ -351,11 +379,13 @@ const idParam: Schema = {
   required: true,
   schema: { type: "string" },
 };
+/** A response whose JSON body matches the named schema. */
 const jsonBody = (name: string, description: string): Schema => ({
   content: { "application/json": { schema: ref(name) } },
   description,
 });
 
+/** The operations, by path and then by method. */
 const paths: Record<string, Record<string, Schema>> = {
   "/api/v1/activity": {
     get: {
@@ -367,7 +397,7 @@ const paths: Record<string, Record<string, Schema>> = {
           in: "query",
           name: "limit",
           required: false,
-          schema: { default: 16, maximum: 16, minimum: 1, type: "integer" },
+          schema: { default: ACTIVITY_LIMIT, maximum: ACTIVITY_LIMIT, minimum: 1, type: "integer" },
         },
       ],
       responses: {
@@ -375,7 +405,7 @@ const paths: Record<string, Record<string, Schema>> = {
           content: { "application/json": { schema: arrayOf(ref("ActivityEvent")) } },
           description: "Events, newest first.",
         },
-        "400": errorResponse("limit is not a whole number from 1 to 16."),
+        "400": errorResponse(`limit is not a whole number from 1 to ${ACTIVITY_LIMIT}.`),
         "503": errorResponse("The first snapshot is still being built."),
       },
       summary: "Recent activity",
@@ -524,7 +554,9 @@ const paths: Record<string, Record<string, Schema>> = {
   },
 };
 
-// Responses every operation shares, added here rather than repeated in each one.
+// Responses that many operations share, added here rather than repeated in each one:
+// 421 for every operation, 401 unless it is public (`security: []`), 403 for writes, and 413
+// for operations with a body.
 for (const ops of Object.values(paths)) {
   for (const [method, op] of Object.entries(ops)) {
     const responses = op["responses"] as Record<string, Json>;
@@ -538,7 +570,13 @@ for (const ops of Object.values(paths)) {
   }
 }
 
-// Top-level keys keep the conventional OpenAPI order, and tags keep the order /docs shows them in.
+/**
+ * The complete OpenAPI document.
+ *
+ * @remarks
+ * Top-level keys keep the conventional OpenAPI order, and tags keep the order `/docs` shows
+ * them in, rather than being sorted.
+ */
 // oxlint-disable-next-line sort-keys
 export const openapi: Schema = {
   openapi: "3.1.0",

@@ -1,10 +1,16 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["typescript", "unicorn", "oxc"],
+  "plugins": ["typescript", "unicorn", "oxc", "jsdoc"],
   "categories": {
     "correctness": "error"
   },
   "rules": {
+    "jsdoc/check-tag-names": ["error", { "typed": true }],
+    "jsdoc/empty-tags": "error",
+    "jsdoc/no-defaults": "error",
+    "jsdoc/require-param-description": "error",
+    "jsdoc/require-param-name": "error",
+    "jsdoc/require-returns-description": "error",
     "sort-keys": [
       "error",
       "asc",
@@ -13,6 +19,16 @@
         "natural": true
       }
     ]
+  },
+  "settings": {
+    "jsdoc": {
+      "tagNamePreference": {
+        "defaultValue": "defaultValue",
+        "packageDocumentation": "packageDocumentation",
+        "remarks": "remarks",
+        "typeParam": "typeParam"
+      }
+    }
   },
   "env": {
     "builtin": true,
