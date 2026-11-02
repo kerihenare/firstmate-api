@@ -1,5 +1,5 @@
 /**
- * The HTTP server: security checks, routing and request validation.
+ * The HTTP server: security checks, routing and request validation, built on Hono.
  *
  * @remarks
  * Each request passes these checks in order:
@@ -10,11 +10,16 @@
  * 4. Everything else needs the API key, when one is set (401).
  * 5. The `/api/v1/*` routes.
  *
+ * Hono runs middleware and handlers in the order they are registered, and stops at the first
+ * one that returns a response, so the order of the `app.*` calls below is the order above.
+ *
  * @packageDocumentation
  */
 import { timingSafeEqual } from "node:crypto";
-import { createServer } from "node:http";
-import type { IncomingMessage, ServerResponse } from "node:http";
+
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 
 import { settings } from "./env.ts";
 import {
@@ -41,14 +46,8 @@ import type { ApiError, Bearings, NoteReceipt, RefreshReceipt } from "./types.ts
 /** Host names this server answers to. Requests for any other Host get 421. */
 const ALLOWED_HOSTS = new Set(settings.allowedHosts);
 
-/** `/api/v1/questions/{id}/answers`. The id is captured and checked with {@link IdSchema}. */
-const ANSWERS_ROUTE = /^\/api\/v1\/questions\/([^/]+)\/answers$/;
-
 /** The bearer token every `/api/v1/*` request must send, or `""` to leave the API open. */
 const API_KEY = settings.apiKey;
-
-/** `/api/v1/questions/{id}`. The id is captured and checked with {@link IdSchema}. */
-const DECISION_ROUTE = /^\/api\/v1\/questions\/([^/]+)$/;
 
 // SWAGGER comes before DOCS because DOCS is built from it.
 /** Where the Swagger UI assets for `/docs` are loaded from, pinned with subresource integrity. */
@@ -71,10 +70,10 @@ const MAX_BODY_BYTES = 20_000;
 /** The port to listen on. */
 const PORT = settings.port;
 
-/** `/api/v1/tasks/{id}`. The id is captured and checked with {@link IdSchema}. */
-const TASK_ROUTE = /^\/api\/v1\/tasks\/([^/]+)$/;
-
 // ---------- types ----------
+
+/** Every HTTP status an error response can carry. */
+type ErrorStatus = 400 | 401 | 403 | 404 | 413 | 415 | 421 | 422 | 500 | 502 | 503;
 
 /** The outcome of {@link readJson}: the parsed body, or the error response to send instead. */
 type JsonBody =
@@ -86,27 +85,20 @@ type JsonBody =
       message: string;
       ok: false;
       /** The HTTP status to respond with. */
-      status: number;
+      status: ErrorStatus;
     };
 
 // ---------- request parsing ----------
 
 /**
- * The id a route captures, when the route matches and the id is valid.
+ * The `id` path parameter, when it is valid.
  *
- * @param pattern - A route with one capture group for the id.
- * @param route - The request path, without a trailing slash.
- * @returns The id, or `undefined` when the route does not match or the id is not valid (see
- *   {@link IdSchema}), in which case the request falls through to 404.
+ * @returns The id, or `undefined` when it is not valid (see {@link IdSchema}), in which case
+ *   the caller responds 404 as if the route did not exist.
  */
-function routeId(pattern: RegExp, route: string): string | undefined {
-  const parsed = IdSchema.safeParse(pattern.exec(route)?.[1]);
+function routeId(c: Context): string | undefined {
+  const parsed = IdSchema.safeParse(c.req.param("id"));
   return parsed.success ? parsed.data : undefined;
-}
-
-/** A query parameter, or `undefined` when it is absent, ready for a Zod schema. */
-function query(url: URL, name: string): string | undefined {
-  return url.searchParams.get(name) ?? undefined;
 }
 
 /**
@@ -114,10 +106,11 @@ function query(url: URL, name: string): string | undefined {
  *
  * @remarks
  * The Content-Type must be `application/json` (415) and the body at most
- * {@link MAX_BODY_BYTES} (413). An empty body parses as `null`.
+ * {@link MAX_BODY_BYTES} (413). The body is read as a stream, so an oversized body is refused
+ * without being buffered whole. An empty body parses as `null`.
  */
-async function readJson(req: IncomingMessage): Promise<JsonBody> {
-  if (!/^application\/json\b/i.test(req.headers["content-type"] ?? "")) {
+async function readJson(c: Context): Promise<JsonBody> {
+  if (!/^application\/json\b/i.test(c.req.header("content-type") ?? "")) {
     return {
       code: "unsupported_media_type",
       message: "Content-Type must be application/json.",
@@ -126,15 +119,14 @@ async function readJson(req: IncomingMessage): Promise<JsonBody> {
     };
   }
 
-  const chunks: Buffer[] = [];
+  const chunks: Uint8Array[] = [];
   let size = 0;
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer;
-    size += buffer.length;
+  for await (const chunk of c.req.raw.body ?? []) {
+    size += chunk.byteLength;
     if (size > MAX_BODY_BYTES) {
       return { code: "too_large", message: "The body is too large.", ok: false, status: 413 };
     }
-    chunks.push(buffer);
+    chunks.push(chunk);
   }
 
   const text = Buffer.concat(chunks).toString("utf8");
@@ -151,10 +143,15 @@ async function readJson(req: IncomingMessage): Promise<JsonBody> {
  * Whether the Host header names an allowed host. The port is ignored, and IPv6 hosts keep
  * their brackets (`[::1]`).
  */
-function hostOk(req: IncomingMessage): boolean {
-  const host = (req.headers.host ?? "").toLowerCase();
+function hostOk(c: Context): boolean {
+  const host = (c.req.header("host") ?? "").toLowerCase();
   const name = host.startsWith("[") ? `${host.split("]")[0]}]` : host.replace(/:\d+$/, "");
   return ALLOWED_HOSTS.has(name);
+}
+
+/** Whether the request only reads. HEAD is routed like GET, and Hono drops its body. */
+function isRead(c: Context): boolean {
+  return c.req.method === "GET" || c.req.method === "HEAD";
 }
 
 /**
@@ -164,9 +161,9 @@ function hostOk(req: IncomingMessage): boolean {
  * The comparison takes the same time however much of the key matches, so the key cannot be
  * guessed one character at a time.
  */
-function keyOk(req: IncomingMessage): boolean {
+function keyOk(c: Context): boolean {
   if (!API_KEY) return true;
-  const given = /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1] ?? "";
+  const given = /^Bearer (.+)$/.exec(c.req.header("authorization") ?? "")?.[1] ?? "";
   const givenBytes = Buffer.from(given);
   const keyBytes = Buffer.from(API_KEY);
   return givenBytes.length === keyBytes.length && timingSafeEqual(givenBytes, keyBytes);
@@ -179,8 +176,8 @@ function keyOk(req: IncomingMessage): boolean {
  * Browsers send Origin on cross-site writes, so a write from a page on another site (CSRF) is
  * refused. Callers that send no Origin, such as curl and scripts, are unaffected.
  */
-function originOk(req: IncomingMessage): boolean {
-  const origin = req.headers.origin;
+function originOk(c: Context): boolean {
+  const origin = c.req.header("origin");
   if (origin === undefined) return true;
   try {
     return ALLOWED_HOSTS.has(new URL(origin).hostname.toLowerCase());
@@ -195,16 +192,16 @@ function originOk(req: IncomingMessage): boolean {
  * Run an inbox write and respond with a receipt (202), or with an error when the write is
  * refused (404, 422) or the inbox fails (502).
  */
-async function deliver(res: ServerResponse, write: () => Promise<AnswerOutcome>): Promise<void> {
+async function deliver(c: Context, write: () => Promise<AnswerOutcome>): Promise<Response> {
   try {
     const outcome = await write();
-    if (!outcome.ok) return fail(res, outcome.status, outcome.code, outcome.message);
+    if (!outcome.ok) return fail(c, outcome.status, outcome.code, outcome.message);
   } catch (error) {
     const message = error instanceof Error ? error.message : "The note could not be recorded.";
-    return fail(res, 502, "note_failed", message);
+    return fail(c, 502, "note_failed", message);
   }
   const receipt: NoteReceipt = { accepted: true, receivedAt: new Date().toISOString() };
-  return send(res, 202, receipt);
+  return c.json(receipt, 202);
 }
 
 /**
@@ -214,188 +211,174 @@ async function deliver(res: ServerResponse, write: () => Promise<AnswerOutcome>)
  * @param code - A stable machine-readable error code.
  * @param message - A plain-English explanation.
  */
-function fail(res: ServerResponse, status: number, code: string, message: string): void {
+function fail(c: Context, status: ErrorStatus, code: string, message: string): Response {
   const body: ApiError = { error: { code, message } };
-  send(res, status, body);
+  return c.json(body, status);
 }
 
-/**
- * The cached snapshot, or `null` after responding 503 because there is none yet.
- *
- * @remarks
- * Callers return straight away on `null`, since the response has already been sent.
- */
-function needBearings(res: ServerResponse): Bearings | null {
-  const bearings = getBearings();
-  if (bearings) return bearings;
+/** Respond 503 because there is no snapshot yet, saying whether the first build failed. */
+function notReady(c: Context): Response {
   const { error } = status();
   const message = error
     ? `The first snapshot failed and will be retried shortly: ${error}`
     : "The first snapshot is still being built. Retry shortly.";
-  fail(res, 503, "not_ready", message);
-  return null;
+  return fail(c, 503, "not_ready", message);
 }
 
 /**
- * Send a complete response. Strings are sent as-is and anything else as JSON.
+ * Run a handler with the cached snapshot, or respond 503 (see {@link notReady}) when there is
+ * none yet.
  *
- * @remarks
- * Every response is marked `no-store` (the data changes every refresh) and `nosniff`.
+ * @param respond - Builds the response from the snapshot.
  */
-function send(
-  res: ServerResponse,
-  status: number,
-  body: unknown,
-  contentType = "application/json; charset=utf-8",
-): void {
-  const text = typeof body === "string" ? body : JSON.stringify(body);
-  res.writeHead(status, {
-    "Cache-Control": "no-store",
-    "Content-Length": Buffer.byteLength(text),
-    "Content-Type": contentType,
-    "X-Content-Type-Options": "nosniff",
-  });
-  res.end(text);
+function withBearings(c: Context, respond: (bearings: Bearings) => Response): Response {
+  const bearings = getBearings();
+  return bearings ? respond(bearings) : notReady(c);
 }
+
+// ---------- middleware ----------
+
+/** Refuse requests whose Host header is not an allowed host name (421). */
+const checkHost: MiddlewareHandler = async (c, next) => {
+  if (!hostOk(c)) return fail(c, 421, "bad_host", "Use localhost to reach this API.");
+  await next();
+};
+
+/** Refuse requests without the API key (401), when one is set. */
+const checkKey: MiddlewareHandler = async (c, next) => {
+  if (!keyOk(c)) return fail(c, 401, "unauthorized", "Send the API key as a bearer token.");
+  await next();
+};
+
+/** Refuse writes sent from another site's page (403). */
+const checkOrigin: MiddlewareHandler = async (c, next) => {
+  if (!isRead(c) && !originOk(c)) {
+    return fail(c, 403, "bad_origin", "Writes from other sites are not allowed.");
+  }
+  await next();
+};
+
+/** Mark every response `no-store` (the data changes every refresh) and `nosniff`. */
+const noStore: MiddlewareHandler = async (c, next) => {
+  await next();
+  c.res.headers.set("Cache-Control", "no-store");
+  c.res.headers.set("X-Content-Type-Options", "nosniff");
+};
 
 // ---------- routing ----------
 
-/** Handle one request. See the module comment for the order of checks. */
-async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  if (!hostOk(req)) return fail(res, 421, "bad_host", "Use localhost to reach this API.");
+// `strict: false` ignores a trailing slash, so /api/v1/tasks/ is /api/v1/tasks.
+const app = new Hono({ strict: false });
 
-  const url = new URL(req.url ?? "/", "http://localhost");
-  // Trailing slashes are ignored, so /api/v1/tasks/ is /api/v1/tasks.
-  const route = url.pathname.replace(/\/+$/, "") || "/";
-  const method = req.method ?? "GET";
-  // HEAD is routed like GET; Node leaves the body out of HEAD responses by itself.
-  const isRead = method === "GET" || method === "HEAD";
-  if (!isRead && !originOk(req)) {
-    return fail(res, 403, "bad_origin", "Writes from other sites are not allowed.");
+app.use(noStore, checkHost, checkOrigin);
+
+// Public: the spec, the docs page and health never need the key.
+app.get("/openapi.json", (c) => c.json(openapi));
+app.get("/docs", (c) => c.html(DOCS));
+app.get("/", (c) => c.html(DOCS));
+app.get("/health", (c) => {
+  const health = status();
+  // The error text can name local paths, so only callers with the key see it.
+  const error = health.error && !keyOk(c) ? "refresh failed" : health.error;
+  return c.json({ ok: true, ...health, error });
+});
+
+// Everything below needs the key, including unknown paths.
+app.use(checkKey);
+
+app.get("/api/v1/activity", (c) => {
+  const limit = ActivityLimitSchema.safeParse(c.req.query("limit"));
+  if (!limit.success) {
+    return fail(
+      c,
+      400,
+      "invalid_limit",
+      `limit must be a whole number from 1 to ${ACTIVITY_LIMIT}.`,
+    );
   }
+  return withBearings(c, (bearings) => c.json(bearings.activity.slice(0, limit.data)));
+});
 
-  // Public: the spec, the docs page and health never need the key.
-  if (isRead && route === "/openapi.json") return send(res, 200, openapi);
-  if (isRead && (route === "/docs" || route === "/")) {
-    return send(res, 200, DOCS, "text/html; charset=utf-8");
-  }
-  if (isRead && route === "/health") {
-    const health = status();
-    // The error text can name local paths, so only callers with the key see it.
-    const error = health.error && !keyOk(req) ? "refresh failed" : health.error;
-    return send(res, 200, { ok: true, ...health, error });
-  }
+app.get("/api/v1/bearings", (c) => withBearings(c, (bearings) => c.json(bearings)));
 
-  if (!keyOk(req)) return fail(res, 401, "unauthorized", "Send the API key as a bearer token.");
+app.get("/api/v1/questions", (c) => withBearings(c, (bearings) => c.json(bearings.waitingOnYou)));
 
-  if (isRead) {
-    if (route === "/api/v1/bearings") {
-      const bearings = needBearings(res);
-      return bearings ? send(res, 200, bearings) : undefined;
+app.get("/api/v1/questions/:id", (c) => {
+  const decisionId = routeId(c);
+  if (!decisionId) return c.notFound();
+  return withBearings(c, (bearings) => {
+    const decision = bearings.waitingOnYou.decisions.find((d) => d.id === decisionId);
+    if (!decision) {
+      return fail(c, 404, "decision_not_found", `No open decision with id "${decisionId}".`);
     }
-
-    if (route === "/api/v1/tasks") {
-      const parsed = TaskStateFilterSchema.safeParse(query(url, "state"));
-      if (!parsed.success) {
-        return fail(res, 400, "invalid_state", `state must be one of: ${TASK_STATES.join(", ")}.`);
-      }
-      const state = parsed.data;
-      const bearings = needBearings(res);
-      if (!bearings) return;
-      const tasks = state
-        ? bearings.underway.filter((task) => task.state === state)
-        : bearings.underway;
-      return send(res, 200, tasks);
-    }
-
-    const taskId = routeId(TASK_ROUTE, route);
-    if (taskId) {
-      const bearings = needBearings(res);
-      if (!bearings) return;
-      const task = bearings.underway.find((t) => t.id === taskId);
-      if (!task) return fail(res, 404, "task_not_found", `No task under way with id "${taskId}".`);
-      return send(res, 200, task);
-    }
-
-    if (route === "/api/v1/questions") {
-      const bearings = needBearings(res);
-      return bearings ? send(res, 200, bearings.waitingOnYou) : undefined;
-    }
-
-    const decisionId = routeId(DECISION_ROUTE, route);
-    if (decisionId) {
-      const bearings = needBearings(res);
-      if (!bearings) return;
-      const decision = bearings.waitingOnYou.decisions.find((d) => d.id === decisionId);
-      if (!decision) {
-        return fail(res, 404, "decision_not_found", `No open decision with id "${decisionId}".`);
-      }
-      return send(res, 200, decision);
-    }
-
-    if (route === "/api/v1/activity") {
-      const limit = ActivityLimitSchema.safeParse(query(url, "limit"));
-      if (!limit.success) {
-        return fail(
-          res,
-          400,
-          "invalid_limit",
-          `limit must be a whole number from 1 to ${ACTIVITY_LIMIT}.`,
-        );
-      }
-      const bearings = needBearings(res);
-      if (!bearings) return;
-      return send(res, 200, bearings.activity.slice(0, limit.data));
-    }
-  }
-
-  if (method === "POST") {
-    const answersFor = routeId(ANSWERS_ROUTE, route);
-    if (answersFor) {
-      // Answers are checked against the open decisions, so there must be a snapshot.
-      if (!needBearings(res)) return;
-      const body = await readJson(req);
-      if (!body.ok) return fail(res, body.status, body.code, body.message);
-      const request = AnswerRequestSchema.safeParse(body.value);
-      if (!request.success) {
-        const expected =
-          'Expected {"answers":[{"question":1,"answer":"..."}]}, with each question answered once.';
-        return fail(res, 400, "invalid_body", expected);
-      }
-      return deliver(res, () => sendAnswers(answersFor, request.data));
-    }
-
-    if (route === "/api/v1/notes") {
-      const body = await readJson(req);
-      if (!body.ok) return fail(res, body.status, body.code, body.message);
-      const request = NoteRequestSchema.safeParse(body.value);
-      if (!request.success) return fail(res, 400, "invalid_body", 'Expected {"text":"..."}.');
-      return deliver(res, async () => {
-        await sendGeneralNote(request.data.text);
-        return { ok: true };
-      });
-    }
-
-    if (route === "/api/v1/refresh") {
-      refreshInBackground();
-      const receipt: RefreshReceipt = { accepted: true };
-      return send(res, 202, receipt);
-    }
-  }
-
-  return fail(res, 404, "not_found", "No such endpoint. See /docs.");
-}
-
-// ---------- start ----------
-
-const server = createServer((req, res) => {
-  handle(req, res).catch((error: unknown) => {
-    console.error(`${req.method ?? "?"} ${req.url ?? "?"} failed:`, error);
-    if (!res.headersSent) fail(res, 500, "internal_error", "Something went wrong.");
+    return c.json(decision);
   });
 });
 
+app.get("/api/v1/tasks", (c) => {
+  const parsed = TaskStateFilterSchema.safeParse(c.req.query("state"));
+  if (!parsed.success) {
+    return fail(c, 400, "invalid_state", `state must be one of: ${TASK_STATES.join(", ")}.`);
+  }
+  const state = parsed.data;
+  return withBearings(c, (bearings) =>
+    c.json(state ? bearings.underway.filter((task) => task.state === state) : bearings.underway),
+  );
+});
+
+app.get("/api/v1/tasks/:id", (c) => {
+  const taskId = routeId(c);
+  if (!taskId) return c.notFound();
+  return withBearings(c, (bearings) => {
+    const task = bearings.underway.find((t) => t.id === taskId);
+    if (!task) return fail(c, 404, "task_not_found", `No task under way with id "${taskId}".`);
+    return c.json(task);
+  });
+});
+
+app.post("/api/v1/notes", async (c) => {
+  const body = await readJson(c);
+  if (!body.ok) return fail(c, body.status, body.code, body.message);
+  const request = NoteRequestSchema.safeParse(body.value);
+  if (!request.success) return fail(c, 400, "invalid_body", 'Expected {"text":"..."}.');
+  return deliver(c, async () => {
+    await sendGeneralNote(request.data.text);
+    return { ok: true };
+  });
+});
+
+app.post("/api/v1/questions/:id/answers", async (c) => {
+  const answersFor = routeId(c);
+  if (!answersFor) return c.notFound();
+  // Answers are checked against the open decisions, so there must be a snapshot.
+  if (!getBearings()) return notReady(c);
+  const body = await readJson(c);
+  if (!body.ok) return fail(c, body.status, body.code, body.message);
+  const request = AnswerRequestSchema.safeParse(body.value);
+  if (!request.success) {
+    const expected =
+      'Expected {"answers":[{"question":1,"answer":"..."}]}, with each question answered once.';
+    return fail(c, 400, "invalid_body", expected);
+  }
+  return deliver(c, () => sendAnswers(answersFor, request.data));
+});
+
+app.post("/api/v1/refresh", (c) => {
+  refreshInBackground();
+  const receipt: RefreshReceipt = { accepted: true };
+  return c.json(receipt, 202);
+});
+
+app.notFound((c) => fail(c, 404, "not_found", "No such endpoint. See /docs."));
+
+app.onError((error, c) => {
+  console.error(`${c.req.method} ${c.req.url} failed:`, error);
+  return fail(c, 500, "internal_error", "Something went wrong.");
+});
+
+// ---------- start ----------
+
 refreshInBackground();
-server.listen(PORT, HOST, () => {
+serve({ fetch: app.fetch, hostname: HOST, port: PORT }, () => {
   console.log(`bearings-api on http://localhost:${PORT}/  (docs: /docs, spec: /openapi.json)`);
 });

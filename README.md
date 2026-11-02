@@ -2,7 +2,7 @@
 
 A JSON API over the Fleet Bearings view of a [Firstmate](https://github.com/kunchenguid/firstmate) home: the questions waiting on the captain, the work under way with its validation steps, what landed, what is queued, and recent activity. It is described by an OpenAPI 3.1 spec that the server itself serves.
 
-TypeScript with one runtime dependency, [Zod](https://zod.dev), which checks every input: settings, request bodies, query and path parameters, and what Firstmate prints. Node 26 runs the `.ts` files directly. Uses pnpm (pinned in `packageManager`).
+TypeScript on [Hono](https://hono.dev) (served by `@hono/node-server`), with [Zod](https://zod.dev) checking every input: settings, request bodies, query and path parameters, and what Firstmate prints. Node 26 runs the `.ts` files directly. Uses pnpm (pinned in `packageManager`).
 
 ## Run it
 
