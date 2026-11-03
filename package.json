@@ -19,7 +19,7 @@
   },
   "devDependencies": {
     "@apidevtools/swagger-parser": "^13.1.0",
-    "@types/node": "^26.6.6",
+    "@types/node": "^24.19.2",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "oxfmt": "^0.75.0",
@@ -27,7 +27,7 @@
     "typescript": "^7.0.2"
   },
   "engines": {
-    "node": ">=26"
+    "node": ">=24"
   },
   "packageManager": "pnpm@12.16.1"
 }

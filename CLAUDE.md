@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A read-mostly JSON API (OpenAPI 3.1) over the "Fleet Bearings" view of a [Firstmate](https://github.com/kunchenguid/firstmate) home. TypeScript with three runtime dependencies: **Hono 4** (plus `@hono/node-server`) for HTTP and **Zod 4** to parse every input. Node 26 (`.nvmrc`) runs the `.ts` files directly (type stripping), so there is no build step. Package manager is pnpm, pinned via `packageManager`. `devDependencies` are only the compiler (TypeScript 7), oxlint, oxfmt and the spec validators used by `scripts/check.ts`.
+A read-mostly JSON API (OpenAPI 3.1) over the "Fleet Bearings" view of a [Firstmate](https://github.com/kunchenguid/firstmate) home. TypeScript with three runtime dependencies: **Hono 4** (plus `@hono/node-server`) for HTTP and **Zod 4** to parse every input. Node 24+ (`.nvmrc` pins 24) runs the `.ts` files directly (type stripping), so there is no build step. Package manager is pnpm, pinned via `packageManager`. `devDependencies` are only the compiler (TypeScript 7), oxlint, oxfmt and the spec validators used by `scripts/check.ts`.
 
 ## Commands
 
